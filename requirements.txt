@@ -1,3 +1,0 @@
-requests
-discord dot py
-python dotenv
