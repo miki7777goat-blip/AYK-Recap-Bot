@@ -6,22 +6,20 @@ import requests
 import telebot
 from telebot import types
 
-# ===== CONFIGURATION =====
 BOT_TOKEN = "8909534863:AAG9F4ZwZRaT0RYovkaEKauvEtzM91-j2qk"
 OWNER_ID = 8415289516
 ADMIN_GROUP_ID = -1004448651266
-
-WEBHOOK_URL = "https://aykrecaptool.lovable.app/api/public/subscription/update;"
+WEBHOOK_URL = "https://aykrecaptool.lovable.app/api/public/subscription/update"
 WEBHOOK_SECRET = "MKivv5WQl1i5RhdumjWjcad6Pk7YqgRG96v1q72RQ4Qwwvad"
 
-bot = telebot.TeleBot(BOT_TOKEN)
+bot = telebot.TeleBot(BOT_TOKEN, parse_mode=None)
 app = flask.Flask(__name__)
-
 DATA_FILE = "bot_data.json"
-user_states = {}  # { user_id: {'step': ..., 'plan': ..., 'email': ...} }
+
+user_states = {}
+pending_requests = {}
 
 
-# ===== DATA STORAGE =====
 def load_data():
     default_data = {
         "kpay_name": "U Aye",
@@ -40,7 +38,8 @@ def load_data():
         try:
             with open(DATA_FILE, "r", encoding="utf-8") as f:
                 loaded = json.load(f)
-                default_data.update(loaded)
+                if isinstance(loaded, dict):
+                    default_data.update(loaded)
                 return default_data
         except Exception as e:
             print(f"Data load error: {e}")
@@ -52,34 +51,28 @@ def save_data(data):
         json.dump(data, f, ensure_ascii=False, indent=2)
 
 
-# ===== WEBHOOK SUBSCRIPTION SYNC =====
 def update_web_subscription(email, plan, duration_days=30):
     payload = {
         "email": email.strip().lower(),
-        "plan": plan.strip().upper(),  # "PRO" or "VIP"
+        "plan": plan.strip().upper(),
         "status": "ACTIVE",
         "durationDays": duration_days,
         "customDailyQuota": None,
         "customCharLimit": None,
     }
-    headers = {
-        "Content-Type": "application/json",
-    }
+    headers = {"Content-Type": "application/json"}
     if WEBHOOK_SECRET:
         headers["x-webhook-secret"] = WEBHOOK_SECRET
         headers["Authorization"] = f"Bearer {WEBHOOK_SECRET}"
-
     try:
         res = requests.post(WEBHOOK_URL, json=payload, headers=headers, timeout=15)
         print(f"Webhook Status: {res.status_code} | Response: {res.text}")
-        ok = res.status_code in (200, 201)
-        return ok, res.text
+        return res.status_code in (200, 201), res.text
     except Exception as e:
         print(f"Webhook error: {e}")
         return False, str(e)
 
 
-# ===== MENUS =====
 def get_main_menu(user_id=None):
     markup = types.InlineKeyboardMarkup(row_width=2)
     markup.add(
@@ -89,9 +82,7 @@ def get_main_menu(user_id=None):
         types.InlineKeyboardButton("💬 Support", callback_data="menu_support"),
     )
     if user_id == OWNER_ID:
-        markup.add(
-            types.InlineKeyboardButton("⚙️ Owner Menu", callback_data="owner_menu")
-        )
+        markup.add(types.InlineKeyboardButton("⚙️ Owner Menu", callback_data="owner_menu"))
     return markup
 
 
@@ -106,33 +97,34 @@ def get_owner_menu():
         types.InlineKeyboardButton("🚫 Ban User", callback_data="set_ban"),
         types.InlineKeyboardButton("✅ Unban User", callback_data="set_unban"),
         types.InlineKeyboardButton("📊 View Settings", callback_data="view_settings"),
+        types.InlineKeyboardButton("🏠 Main Menu", callback_data="go_home"),
     )
     return markup
 
 
-# ===== START & BASIC HANDLERS =====
 @bot.message_handler(commands=["start"])
 def handle_start(message):
     user_id = message.from_user.id
     data = load_data()
+
     if user_id in data.get("banned_users", []):
         bot.send_message(message.chat.id, "🚫 You are banned from using this bot.")
         return
 
+    user_states[user_id] = {}
+
     args = message.text.split()
-    if len(args) > 1:
-        ref_code = args[1]
-        if ref_code.startswith("ref_"):
-            try:
-                referrer_id = int(ref_code.replace("ref_", ""))
-                if referrer_id != user_id:
-                    refs = data.setdefault("referrals", {})
-                    user_refs = refs.setdefault(str(referrer_id), [])
-                    if user_id not in user_refs:
-                        user_refs.append(user_id)
-                        save_data(data)
-            except ValueError:
-                pass
+    if len(args) > 1 and args[1].startswith("ref_"):
+        try:
+            referrer_id = int(args[1].replace("ref_", "", 1))
+            if referrer_id != user_id:
+                refs = data.setdefault("referrals", {})
+                user_refs = refs.setdefault(str(referrer_id), [])
+                if user_id not in user_refs:
+                    user_refs.append(user_id)
+                    save_data(data)
+        except ValueError:
+            pass
 
     bot.send_message(
         message.chat.id,
@@ -141,12 +133,14 @@ def handle_start(message):
     )
 
 
-@bot.callback_query_handler(
-    func=lambda call: call.data in ["go_home", "menu_ref", "menu_support"]
-)
+@bot.callback_query_handler(func=lambda call: call.data in ["go_home", "menu_ref", "menu_support"])
 def general_menu_cb(call):
     user_id = call.from_user.id
     data = load_data()
+
+    if user_id in data.get("banned_users", []):
+        bot.answer_callback_query(call.id, "You are banned.", show_alert=True)
+        return
 
     if call.data == "go_home":
         bot.edit_message_text(
@@ -159,14 +153,12 @@ def general_menu_cb(call):
         ref_count = sum(1 for v in data.get("referrals", {}).values() if user_id in v)
         ref_link = f"{data.get('referral_link', '')}ref_{user_id}"
         txt = (
-            f"🎁 **Your Referral Link**\n"
+            "🎁 **Your Referral Link**\n"
             f"`{ref_link}`\n\n"
             f"👥 Total Referrals: **{ref_count}**"
         )
         markup = types.InlineKeyboardMarkup()
-        markup.add(
-            types.InlineKeyboardButton("🏠 Main Menu", callback_data="go_home")
-        )
+        markup.add(types.InlineKeyboardButton("🏠 Main Menu", callback_data="go_home"))
         bot.edit_message_text(
             txt,
             chat_id=call.message.chat.id,
@@ -178,9 +170,7 @@ def general_menu_cb(call):
         support_handle = data.get("support", "@mikef07")
         txt = f"💬 **Support**\nContact: {support_handle}"
         markup = types.InlineKeyboardMarkup()
-        markup.add(
-            types.InlineKeyboardButton("🏠 Main Menu", callback_data="go_home")
-        )
+        markup.add(types.InlineKeyboardButton("🏠 Main Menu", callback_data="go_home"))
         bot.edit_message_text(
             txt,
             chat_id=call.message.chat.id,
@@ -188,15 +178,16 @@ def general_menu_cb(call):
             reply_markup=markup,
             parse_mode="Markdown",
         )
+
     bot.answer_callback_query(call.id)
 
 
-# ===== OWNER MENU & SETTINGS =====
 @bot.callback_query_handler(func=lambda call: call.data == "owner_menu")
 def owner_menu_cb(call):
     if call.from_user.id != OWNER_ID:
         bot.answer_callback_query(call.id, "Owner only!", show_alert=True)
         return
+
     bot.edit_message_text(
         "⚙️ **Owner Control Panel**",
         chat_id=call.message.chat.id,
@@ -210,10 +201,12 @@ def owner_menu_cb(call):
 @bot.callback_query_handler(func=lambda call: call.data == "view_settings")
 def view_settings_cb(call):
     if call.from_user.id != OWNER_ID:
+        bot.answer_callback_query(call.id, "Owner only!", show_alert=True)
         return
+
     data = load_data()
     txt = (
-        f"⚙️ **Current Settings**\n"
+        "⚙️ **Current Settings**\n"
         f"• KPay: `{data['kpay_name']}` - `{data['kpay_no']}`\n"
         f"• Wave: `{data['wave_name']}` - `{data['wave_no']}`\n"
         f"• Pro Price: `{data['pro_price']}`\n"
@@ -223,9 +216,7 @@ def view_settings_cb(call):
         f"• Webhook: `{WEBHOOK_URL}`"
     )
     markup = types.InlineKeyboardMarkup()
-    markup.add(
-        types.InlineKeyboardButton("⬅️ Back", callback_data="owner_menu")
-    )
+    markup.add(types.InlineKeyboardButton("⬅️ Back", callback_data="owner_menu"))
     bot.edit_message_text(
         txt,
         chat_id=call.message.chat.id,
@@ -239,8 +230,9 @@ def view_settings_cb(call):
 @bot.callback_query_handler(func=lambda call: call.data.startswith("set_"))
 def handle_setting_start(call):
     if call.from_user.id != OWNER_ID:
+        bot.answer_callback_query(call.id, "Owner only!", show_alert=True)
         return
-    bot.answer_callback_query(call.id, "Enter value...", show_alert=False)
+
     action = call.data
     user_states[call.from_user.id] = {"step": action}
     prompts = {
@@ -252,6 +244,7 @@ def handle_setting_start(call):
         "set_ban": "Send Telegram User ID to ban:",
         "set_unban": "Send Telegram User ID to unban:",
     }
+    bot.answer_callback_query(call.id, "Enter value...", show_alert=False)
     bot.send_message(
         call.message.chat.id,
         prompts.get(action, "Send new value:"),
@@ -259,19 +252,23 @@ def handle_setting_start(call):
     )
 
 
-# ===== BUY FLOW & TEXT/PHOTO HANDLERS =====
 @bot.callback_query_handler(func=lambda call: call.data.startswith("buy_"))
 def handle_buy_plan(call):
-    plan = call.data.split("_", 1)[1]  # "PRO" or "VIP"
+    user_id = call.from_user.id
     data = load_data()
-    price = data["pro_price"] if plan == "PRO" else data["vip_price"]
-    user_states[call.from_user.id] = {"step": "awaiting_email", "plan": plan}
 
+    if user_id in data.get("banned_users", []):
+        bot.answer_callback_query(call.id, "You are banned.", show_alert=True)
+        return
+
+    plan = call.data.split("_", 1)[1]
+    price = data["pro_price"] if plan == "PRO" else data["vip_price"]
+    user_states[user_id] = {"step": "awaiting_email", "plan": plan}
     txt = (
         f"💎 **{plan} Plan** ({price})\n\n"
         f"💳 KPay: `{data['kpay_name']}` (`{data['kpay_no']}`)\n"
         f"🌊 WavePay: `{data['wave_name']}` (`{data['wave_no']}`)\n\n"
-        f"Please send your **Email address** first:"
+        "Please send your **Email address** first:"
     )
     bot.send_message(call.message.chat.id, txt, parse_mode="Markdown")
     bot.answer_callback_query(call.id)
@@ -283,66 +280,64 @@ def handle_messages(message):
     state = user_states.get(user_id, {})
     data = load_data()
 
-    if user_id in data.get("banned_users", []) or user_id in data.get(
-        "spam_users", []
-    ):
+    if user_id in data.get("banned_users", []) or user_id in data.get("spam_users", []):
         return
 
-    # Owner setting updates
     if user_id == OWNER_ID and state.get("step", "").startswith("set_"):
         step = state["step"]
         val = (message.text or "").strip()
+
         if step == "set_kpay":
             parts = val.split()
             if len(parts) < 2:
-                bot.send_message(
-                    message.chat.id, "❌ Format: `Name 09xxxxxxxxx`", parse_mode="Markdown"
-                )
+                bot.send_message(message.chat.id, "❌ Format: `Name 09xxxxxxxxx`", parse_mode="Markdown")
                 return
-            data["kpay_name"] = " ".join(parts[:-1])
-            data["kpay_no"] = parts[-1]
+            data["kpay_name"], data["kpay_no"] = " ".join(parts[:-1]), parts[-1]
         elif step == "set_wave":
             parts = val.split()
             if len(parts) < 2:
-                bot.send_message(
-                    message.chat.id, "❌ Format: `Name 09xxxxxxxxx`", parse_mode="Markdown"
-                )
+                bot.send_message(message.chat.id, "❌ Format: `Name 09xxxxxxxxx`", parse_mode="Markdown")
                 return
-            data["wave_name"] = " ".join(parts[:-1])
-            data["wave_no"] = parts[-1]
+            data["wave_name"], data["wave_no"] = " ".join(parts[:-1]), parts[-1]
         elif step == "set_pro":
+            if not val:
+                bot.send_message(message.chat.id, "❌ Please enter a valid Pro price.")
+                return
             data["pro_price"] = val
         elif step == "set_vip":
+            if not val:
+                bot.send_message(message.chat.id, "❌ Please enter a valid VIP price.")
+                return
             data["vip_price"] = val
         elif step == "set_support":
+            if not val:
+                bot.send_message(message.chat.id, "❌ Please enter a valid Support handle.")
+                return
             data["support"] = val
         elif step == "set_ban":
             try:
                 uid = int(val)
-                if uid not in data["banned_users"]:
-                    data["banned_users"].append(uid)
+                banned = data.setdefault("banned_users", [])
+                if uid not in banned:
+                    banned.append(uid)
             except ValueError:
                 bot.send_message(message.chat.id, "❌ Invalid User ID.")
                 return
         elif step == "set_unban":
             try:
                 uid = int(val)
-                if uid in data["banned_users"]:
-                    data["banned_users"].remove(uid)
+                banned = data.setdefault("banned_users", [])
+                if uid in banned:
+                    banned.remove(uid)
             except ValueError:
                 bot.send_message(message.chat.id, "❌ Invalid User ID.")
                 return
 
         save_data(data)
         user_states[user_id] = {}
-        bot.send_message(
-            message.chat.id,
-            "✅ Updated!",
-            reply_markup=get_main_menu(user_id),
-        )
+        bot.send_message(message.chat.id, "✅ Updated!", reply_markup=get_main_menu(user_id))
         return
 
-    # Step 1: Awaiting email
     if state.get("step") == "awaiting_email" and message.text:
         email = message.text.strip().lower()
         if "@" not in email or "." not in email.split("@")[-1]:
@@ -358,31 +353,31 @@ def handle_messages(message):
         )
         return
 
-    # Step 2: Awaiting payment slip photo
     if state.get("step") == "awaiting_slip" and message.photo:
         file_id = message.photo[-1].file_id
         plan = state.get("plan", "PRO")
         email = state.get("email", "")
+        req_id = f"{user_id}_{message.message_id}"
+        pending_requests[req_id] = {
+            "user_id": user_id,
+            "plan": plan,
+            "email": email,
+        }
 
         markup = types.InlineKeyboardMarkup(row_width=2)
         markup.add(
-            types.InlineKeyboardButton(
-                "✅ Approve", callback_data=f"app_{plan}_{user_id}_{email}"
-            ),
+            types.InlineKeyboardButton("✅ Approve", callback_data=f"app_{req_id}"),
             types.InlineKeyboardButton("❌ Reject", callback_data=f"rej_{user_id}"),
         )
-        markup.add(
-            types.InlineKeyboardButton("⚠️ Spam", callback_data=f"spm_{user_id}")
-        )
+        markup.add(types.InlineKeyboardButton("⚠️ Spam", callback_data=f"spm_{user_id}"))
 
         first_name = message.from_user.first_name or "User"
         caption = (
-            f"🧾 **New Payment Request**\n"
+            "🧾 **New Payment Request**\n"
             f"👤 User: `{first_name}` (`{user_id}`)\n"
             f"📧 Email: `{email}`\n"
             f"💎 Plan: **{plan}**"
         )
-
         bot.send_photo(
             ADMIN_GROUP_ID,
             file_id,
@@ -395,13 +390,9 @@ def handle_messages(message):
             message.chat.id,
             "✅ Payment slip sent to admin. Please wait for approval.",
         )
-        return
 
 
-# ===== ADMIN GROUP CALLBACKS =====
-@bot.callback_query_handler(
-    func=lambda call: call.data.startswith(("app_", "rej_", "spm_"))
-)
+@bot.callback_query_handler(func=lambda call: call.data.startswith(("app_", "rej_", "spm_")))
 def admin_actions(call):
     if call.from_user.id != OWNER_ID:
         bot.answer_callback_query(call.id, "Admin only!", show_alert=True)
@@ -410,15 +401,19 @@ def admin_actions(call):
     data = load_data()
 
     if call.data.startswith("app_"):
-        parts = call.data.split("_", 3)
-        if len(parts) < 4:
-            bot.answer_callback_query(call.id, "Invalid data", show_alert=True)
+        req_id = call.data.split("_", 1)[1]
+        req_info = pending_requests.get(req_id)
+        if not req_info:
+            bot.answer_callback_query(call.id, "Request expired or not found.", show_alert=True)
             return
-        _, plan, target_str, email = parts
-        target_user = int(target_str)
+
+        target_user = req_info["user_id"]
+        plan = req_info["plan"]
+        email = req_info["email"]
 
         ok, resp_text = update_web_subscription(email, plan, duration_days=30)
         if ok:
+            pending_requests.pop(req_id, None)
             try:
                 bot.send_message(
                     target_user,
@@ -427,7 +422,6 @@ def admin_actions(call):
                 )
             except Exception as e:
                 print(f"Notify user error: {e}")
-
             try:
                 bot.edit_message_caption(
                     caption=(call.message.caption or "") + "\n\n✅ **APPROVED BY ADMIN**",
@@ -447,11 +441,13 @@ def admin_actions(call):
             bot.answer_callback_query(call.id, "Web Sync Error!", show_alert=True)
 
     elif call.data.startswith("rej_"):
-        target_user = int(call.data.split("_", 1)[1])
         try:
-            bot.send_message(
-                target_user, "❌ Your payment request was rejected. Contact support."
-            )
+            target_user = int(call.data.split("_", 1)[1])
+        except ValueError:
+            bot.answer_callback_query(call.id, "Invalid user", show_alert=True)
+            return
+        try:
+            bot.send_message(target_user, "❌ Your payment request was rejected. Contact support.")
         except Exception:
             pass
         try:
@@ -466,9 +462,14 @@ def admin_actions(call):
         bot.answer_callback_query(call.id, "Rejected")
 
     elif call.data.startswith("spm_"):
-        target_user = int(call.data.split("_", 1)[1])
-        if target_user not in data.get("spam_users", []):
-            data.setdefault("spam_users", []).append(target_user)
+        try:
+            target_user = int(call.data.split("_", 1)[1])
+        except ValueError:
+            bot.answer_callback_query(call.id, "Invalid user", show_alert=True)
+            return
+        spam_list = data.setdefault("spam_users", [])
+        if target_user not in spam_list:
+            spam_list.append(target_user)
             save_data(data)
         try:
             bot.send_message(target_user, "⚠️ You have been marked as spam.")
@@ -486,23 +487,15 @@ def admin_actions(call):
         bot.answer_callback_query(call.id, "Marked as spam")
 
 
-# ===== FLASK WEBHOOK ENDPOINT =====
 @app.route("/api/public/subscription/update", methods=["POST"])
 def subscription_webhook():
     if WEBHOOK_SECRET:
         provided_secret = flask.request.headers.get("x-webhook-secret", "")
         auth_header = flask.request.headers.get("Authorization", "")
-        valid = (provided_secret == WEBHOOK_SECRET) or (
-            auth_header == f"Bearer {WEBHOOK_SECRET}"
-        )
-        if not valid:
+        if not ((provided_secret == WEBHOOK_SECRET) or (auth_header == f"Bearer {WEBHOOK_SECRET}")):
             return flask.jsonify({"ok": False, "error": "Unauthorized"}), 401
-
     payload = flask.request.get_json(silent=True) or {}
-    # Acknowledge immediately so the sender never times out; run heavy work in background
-    threading.Thread(
-        target=handle_incoming_webhook_payload, args=(payload,), daemon=True
-    ).start()
+    threading.Thread(target=handle_incoming_webhook_payload, args=(payload,), daemon=True).start()
     return flask.jsonify({"ok": True, "received": True}), 200
 
 
@@ -511,14 +504,18 @@ def handle_incoming_webhook_payload(payload):
 
 
 def run_flask():
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
+    app.run(
+        host="0.0.0.0",
+        port=int(os.environ.get("PORT", 5000)),
+        debug=False,
+        use_reloader=False,
+    )
 
 
-# ===== BOT RUNNING =====
 if __name__ == "__main__":
     print("Starting Flask webhook server...")
     threading.Thread(target=run_flask, daemon=True).start()
     print("Starting Telegram bot...")
     print(f"Target Webhook: {WEBHOOK_URL}")
-    bot.infinity_polling(skip_pending=True)
+    bot.infinity_polling(skip_pending=True, timeout=25, long_polling_timeout=20)
+                
