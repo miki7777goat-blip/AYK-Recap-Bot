@@ -8,15 +8,15 @@ import telebot
 from telebot import types
 
 # ==================== ENVIRONMENT VARIABLES ====================
-BOT_TOKEN = os.getenv("BOT_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN")
-OWNER_ID = int(os.getenv("OWNER_ID", "0"))  # Owner ၏ Telegram Chat ID (ဂဏန်းသီးသန့်)
-ADMIN_GROUP_ID = int(os.getenv("ADMIN_GROUP_ID", "0"))  # Admin Group ID (ဥပမာ: -100xxxxxxxxxx)
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8909534863:AAG9F4ZwZRaT0RYovkaEKauvEtzM91-j2qk")
+OWNER_ID = int(os.getenv("OWNER_ID", "8415289516"))  # Owner ၏ Telegram Chat ID (ဂဏန်းသီးသန့်)
+ADMIN_GROUP_ID = int(os.getenv("ADMIN_GROUP_ID", "-1004448651266"))  # Admin Group ID (ဥပမာ: -100xxxxxxxxxx)
 
 WEBHOOK_URL = os.getenv(
     "WEBHOOK_URL", 
     "https://aykrecaptool.lovable.app/api/public/subscription/update"
 )
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "OSv2efvHvWGB6b4l6jGsr87IZvyYLhMcH5V2YHuHgvSWKpJt")
 PORT = int(os.getenv("PORT", "10000"))  # Render အတွက် Port
 
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
