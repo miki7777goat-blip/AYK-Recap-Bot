@@ -8,7 +8,7 @@ from telebot import types
 
 # ===== CONFIGURATION =====
 BOT_TOKEN = "8909534863:AAG9F4ZwZRaT0RYovkaEKauvEtzM91-j2qk"
-OWNER_ID = 8909534863
+OWNER_ID = 8415289516
 ADMIN_GROUP_ID = -1004448651266
 
 WEBHOOK_URL = "https://aykrecaptool.lovable.app/api/public/subscription/update;"
