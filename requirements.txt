@@ -1,5 +1,6 @@
-requests
 discord.py
 python-dotenv
 flask
-pyTelegramBotAPI
+pyTelegramBotAPI>=4.14.0
+requests>=2.31.0
+
