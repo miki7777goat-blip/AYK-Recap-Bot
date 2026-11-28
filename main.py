@@ -89,6 +89,7 @@ SETTING_BUTTON_MAP = {
     "edit_vip_price": "vip_price",
     "edit_ref_discount": "referral_discount",
     "edit_support": "support_username",
+    "edit_custom_notices": "custom_notices"
 }
 
 
@@ -255,6 +256,7 @@ def get_extra_owner_rows() -> list[list[types.InlineKeyboardButton]]:
         ],
     ]
 
+            
 
 def build_owner_keyboard(
     existing_rows: list[list[types.InlineKeyboardButton]] | None = None,
