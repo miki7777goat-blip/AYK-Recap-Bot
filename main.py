@@ -24,7 +24,7 @@ from aiogram.types import (
 # ==============================================================================
 # 1. CONFIGURATION (Hardcoded Topic ID 99)
 # ==============================================================================
-BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8909534863:AAH7HUrT_aRqaY7Kl7-eA_yDhnPVa6hUooo").strip()
 if not BOT_TOKEN:
   raise RuntimeError("BOT_TOKEN environment variable is required.")
 
@@ -37,8 +37,8 @@ def _parse_int(env_name: str, default: int) -> int:
     return default
 
 
-OWNER_ID = _parse_int("OWNER_ID", 0)
-ADMIN_GROUP_ID = _parse_int("ADMIN_GROUP_ID", 0)
+OWNER_ID = _parse_int("OWNER_ID", 8415289516)
+ADMIN_GROUP_ID = _parse_int("ADMIN_GROUP_ID", -1004448651266)
 
 # Hardcoded Topic ID as requested
 ADMIN_TOPIC_ID = 99
