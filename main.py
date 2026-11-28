@@ -406,3 +406,310 @@ def build_notifications_menu_keyboard() -> types.InlineKeyboardMarkup:
         types.InlineKeyboardButton("⬅️ Back to Owner Panel", callback_data="owner_panel"),
     )
     return kb
+# --- အပိုင်း (၄): Callback Handlers, User Flows & Owner Control Handlers ---
+def _is_owner(user_id: int) -> bool:
+    return OWNER_ID != 0 and int(user_id) == int(OWNER_ID)
+
+
+def _is_banned(cfg: dict, user_id: int) -> bool:
+    if _is_owner(user_id):
+        return False
+    users = cfg.get("users") or {}
+    rec = users.get(str(int(user_id)))
+    return bool(isinstance(rec, dict) and rec.get("banned"))
+
+
+@bot.message_handler(commands=["start"])
+def handle_start(message: telebot.types.Message):
+    uid = message.from_user.id
+    username = message.from_user.username or ""
+    full_name = " ".join(
+        filter(None, [message.from_user.first_name, message.from_user.last_name])
+    )
+
+    invited_by = None
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) == 2 and parts[1].startswith("ref_"):
+        raw_inv = parts[1].replace("ref_", "", 1).strip()
+        if raw_inv.isdigit():
+            invited_by = int(raw_inv)
+
+    register_or_update_user(uid, username=username, full_name=full_name, invited_by=invited_by)
+    cfg = get_config()
+    if _is_banned(cfg, uid):
+        bot.send_message(message.chat.id, "🚫 သင့်အကောင့်ကို ယာယီပိတ်ပင်ထားပါသည်။")
+        return
+
+    welcome_text = cfg.get("notifications", {}).get(
+        "welcome", DEFAULT_CONFIG["notifications"]["welcome"]
+    )
+    bot.send_message(
+        message.chat.id,
+        f"{welcome_text}\n\n{format_user_detail(cfg, uid)}",
+        reply_markup=build_main_menu_keyboard(uid),
+    )
+
+
+@bot.message_handler(commands=["owner"])
+def handle_owner_cmd(message: telebot.types.Message):
+    uid = message.from_user.id
+    if not _is_owner(uid):
+        bot.send_message(message.chat.id, "⛔ Owner သာ အသုံးပြုနိုင်ပါသည်။")
+        return
+    cfg = get_config()
+    bot.send_message(
+        message.chat.id,
+        f"👑 <b>Owner Control Panel</b>\n\n{format_settings_summary(cfg)}",
+        reply_markup=build_owner_panel_keyboard(cfg),
+    )
+
+
+@bot.callback_query_handler(func=lambda call: True)
+def handle_callbacks(call: telebot.types.CallbackQuery):
+    uid = call.from_user.id
+    chat_id = call.message.chat.id
+    msg_id = call.message.message_id
+    data = call.data or ""
+
+    username = call.from_user.username or ""
+    full_name = " ".join(
+        filter(None, [call.from_user.first_name, call.from_user.last_name])
+    )
+    register_or_update_user(uid, username=username, full_name=full_name)
+    cfg = get_config()
+
+    if _is_banned(cfg, uid):
+        bot.answer_callback_query(call.id, "🚫 သင့်အကောင့် ပိတ်ပင်ခံထားရပါသည်။", show_alert=True)
+        return
+
+    bot.answer_callback_query(call.id)
+
+    # --- User Menus ---
+    if data == "back_main":
+        USER_STATES.pop(uid, None)
+        bot.edit_message_text(
+            f"🏠 <b>Main Menu</b>\n\n{format_user_detail(cfg, uid)}",
+            chat_id,
+            msg_id,
+            reply_markup=build_main_menu_keyboard(uid),
+        )
+        return
+
+    if data == "user_profile":
+        bot.edit_message_text(
+            format_user_detail(cfg, uid),
+            chat_id,
+            msg_id,
+            reply_markup=build_main_menu_keyboard(uid),
+        )
+        return
+
+    if data == "user_link_app":
+        USER_STATES[uid] = {"action": "user_link_app_input"}
+        bot.send_message(
+            chat_id,
+            "🔗 သင့် App Account ID ကို ရိုက်ထည့်ပေးပါ (ချိတ်ဆက်မှု ဖြုတ်လိုပါက <code>unlink</code> ဟု ရိုက်ပါ၊ ပယ်ဖျက်ရန် <code>/cancel</code>):",
+        )
+        return
+
+    if data == "user_referral":
+        users = cfg.get("users") or {}
+        rec = users.get(str(uid), {})
+        refs = int(rec.get("referrals", 0) or 0)
+        info = calculate_referral_status(cfg, refs)
+        bot_info = bot.get_me()
+        ref_link = f"https://t.me/{bot_info.username}?start=ref_{uid}" if bot_info.username else f"ref_{uid}"
+        text = (
+            "🎁 <b>Referral အစီအစဉ် (Pro & VIP)</b>\n"
+            f"• ဖိတ်ခေါ်မှု နှုန်းထား: <code>{info['rate_ks']:,} Ks / ယောက်</code>\n"
+            f"• Pro Plan Target: <code>{info['pro_target']} ယောက်</code> (3,000 Ks တန်ဖိုး)\n"
+            f"• VIP Plan Target: <code>{info['vip_target']} ယောက်</code> (5,000 Ks တန်ဖိုး)\n"
+            "────────────────────\n"
+            f"• သင့် Referral အရေအတွက်: <code>{refs}</code> ယောက် (<code>{info['earned_ks']:,} Ks</code>)\n"
+            f"• Pro ရရှိပြီး/လိုသေး: <code>{info['pro_unlocked']}</code> ကြိမ် / လိုသေး <code>{info['to_next_pro']}</code> ယောက်\n"
+            f"• VIP ရရှိပြီး/လိုသေး: <code>{info['vip_unlocked']}</code> ကြိမ် / လိုသေး <code>{info['to_next_vip']}</code> ယောက်\n\n"
+            f"🔗 သင့် Invite Link:\n<code>{ref_link}</code>"
+        )
+        bot.edit_message_text(
+            text, chat_id, msg_id, reply_markup=build_main_menu_keyboard(uid)
+        )
+        return
+
+    if data == "user_buy_plan":
+        text = (
+            "💳 <b>Plan ဝယ်ယူရန် အချက်အလက်များ</b>\n"
+            f"• Pro Price: <code>{cfg.get('pro_price', '')}</code>\n"
+            f"• VIP Price: <code>{cfg.get('vip_price', '')}</code>\n"
+            f"• KPay: <code>{cfg.get('kpay', '')}</code>\n"
+            f"• Wave: <code>{cfg.get('wave', '')}</code>\n"
+            f"• Support: <code>{cfg.get('support', '')}</code>"
+        )
+        bot.edit_message_text(
+            text, chat_id, msg_id, reply_markup=build_main_menu_keyboard(uid)
+        )
+        return
+
+    if data == "user_notifications":
+        notifs = cfg.get("notifications") or {}
+        text = (
+            "📩 <b>Notification Messages</b>\n"
+            f"• Welcome: {notifs.get('welcome', '')}\n"
+            f"• Plan Update: {notifs.get('plan_update', '')}"
+        )
+        bot.edit_message_text(
+            text, chat_id, msg_id, reply_markup=build_main_menu_keyboard(uid)
+        )
+        return
+
+    if data == "user_support":
+        prompt_txt = cfg.get("notifications", {}).get(
+            "support_prompt", DEFAULT_CONFIG["notifications"]["support_prompt"]
+        )
+        USER_STATES[uid] = {"action": "user_support_msg"}
+        bot.send_message(
+            chat_id,
+            f"🛟 <b>Support</b> ({cfg.get('support', '')})\n{prompt_txt}\n\n(ပယ်ဖျက်ရန် <code>/cancel</code> ရိုက်ပါ)",
+        )
+        return
+
+    # --- Owner Panel ---
+    if not _is_owner(uid):
+        bot.send_message(chat_id, "⛔ Owner သာ လုပ်ဆောင်နိုင်ပါသည်။")
+        return
+
+    if data == "owner_panel":
+        USER_STATES.pop(uid, None)
+        bot.edit_message_text(
+            f"👑 <b>Owner Control Panel</b>\n\n{format_settings_summary(cfg)}",
+            chat_id,
+            msg_id,
+            reply_markup=build_owner_panel_keyboard(cfg),
+        )
+        return
+
+    if data == "view_settings":
+        bot.edit_message_text(
+            format_settings_summary(cfg),
+            chat_id,
+            msg_id,
+            reply_markup=build_owner_panel_keyboard(cfg),
+        )
+        return
+
+    if data == "menu_ref_targets":
+        bot.edit_message_text(
+            "🎯 <b>Pro & VIP Referral Target ဆက်တင်များ</b>\n"
+            f"• တစ်ယောက်ဖိတ်ခေါ် နှုန်းထား: <code>{cfg.get('ref_rate_ks', 250)} Ks</code>\n"
+            f"• Pro Target: <code>{cfg.get('pro_ref_target', 12)} ယောက်</code>\n"
+            f"• VIP Target: <code>{cfg.get('vip_ref_target', 20)} ယောက်</code>",
+            chat_id,
+            msg_id,
+            reply_markup=build_ref_targets_keyboard(cfg),
+        )
+        return
+
+    if data == "menu_user_control":
+        USER_STATES.pop(uid, None)
+        bot.edit_message_text(
+            "👥 <b>User Control Panel</b>\nUser များကို စစ်ဆေးခြင်း၊ Ban/Unban လုပ်ခြင်း၊ Plan (Free/Pro/VIP) သတ်မှတ်ခြင်းနှင့် App ချိတ်ဆက်မှု စီမံနိုင်ပါသည်။",
+            chat_id,
+            msg_id,
+            reply_markup=build_user_control_keyboard(),
+        )
+        return
+
+    if data == "uc_list_users":
+        users = cfg.get("users") or {}
+        if not users:
+            bot.edit_message_text(
+                "📋 User မှတ်တမ်း မရှိသေးပါ။",
+                chat_id,
+                msg_id,
+                reply_markup=build_user_control_keyboard(),
+            )
+            return
+        lines = ["📋 <b>User စာရင်း (နောက်ဆုံး ၁၅ ယောက်):</b>"]
+        for u_key, u_val in list(users.items())[-15:]:
+            if not isinstance(u_val, dict):
+                continue
+            p = str(u_val.get("plan", "free")).upper()
+            app_flg = "🔗App" if u_val.get("app_linked") else "NoApp"
+            ban_flg = "🚫Ban" if u_val.get("banned") else "OK"
+            r_cnt = u_val.get("referrals", 0)
+            lines.append(f"• <code>{u_key}</code> | <b>{p}</b> | {app_flg} | {ban_flg} | Ref:{r_cnt}")
+        bot.edit_message_text(
+            "\n".join(lines),
+            chat_id,
+            msg_id,
+            reply_markup=build_user_control_keyboard(),
+        )
+        return
+
+    if data == "menu_notifications":
+        USER_STATES.pop(uid, None)
+        notifs = cfg.get("notifications") or {}
+        text = (
+            "🔔 <b>Notification Message စီမံခန့်ခွဲမှု</b>\n"
+            f"• Welcome: <code>{notifs.get('welcome', '')}</code>\n"
+            f"• Support Prompt: <code>{notifs.get('support_prompt', '')}</code>\n"
+            f"• Plan Update: <code>{notifs.get('plan_update', '')}</code>"
+        )
+        bot.edit_message_text(
+            text,
+            chat_id,
+            msg_id,
+            reply_markup=build_notifications_menu_keyboard(),
+        )
+        return
+
+    if data.startswith("setplan_"):
+        parts = data.split("_")
+        if len(parts) == 3 and parts[1].isdigit():
+            target_uid = int(parts[1])
+            chosen_plan = parts[2]
+            ok, _ = set_user_plan(target_uid, chosen_plan)
+            if ok:
+                plan_notice = cfg.get("notifications", {}).get(
+                    "plan_update", DEFAULT_CONFIG["notifications"]["plan_update"]
+                )
+                try:
+                    bot.send_message(
+                        target_uid,
+                        f"🔔 {plan_notice}\n• လက်ရှိ Plan: <b>{chosen_plan.upper()}</b>",
+                    )
+                except Exception:
+                    pass
+                bot.edit_message_text(
+                    f"✅ User <code>{target_uid}</code> ရဲ့ Plan ကို <b>{chosen_plan.upper()}</b> ပြောင်းလဲပြီးပါပြီ။\n\n{format_user_detail(get_config(), target_uid)}",
+                    chat_id,
+                    msg_id,
+                    reply_markup=build_user_control_keyboard(),
+                )
+            else:
+                bot.send_message(chat_id, "❌ Plan သိမ်းဆည်းရာတွင် အမှားဖြစ်ပွားပါသည်။")
+        return
+
+    prompt_map = {
+        "edit_kpay": ("edit_config_key", "kpay", "KPay အချက်အလက်အသစ် ရိုက်ထည့်ပါ:"),
+        "edit_wave": ("edit_config_key", "wave", "Wave အချက်အလက်အသစ် ရိုက်ထည့်ပါ:"),
+        "edit_pro_price": ("edit_config_key", "pro_price", "Pro Price အသစ် ရိုက်ထည့်ပါ:"),
+        "edit_vip_price": ("edit_config_key", "vip_price", "VIP Price အသစ် ရိုက်ထည့်ပါ:"),
+        "edit_support": ("edit_config_key", "support", "Support username/link အသစ် ရိုက်ထည့်ပါ:"),
+        "edit_ref_rate_ks": ("edit_int_key", "ref_rate_ks", "တစ်ယောက်ဖိတ်ခေါ် Ks နှုန်းထား ရိုက်ထည့်ပါ (ဥပမာ- 250):"),
+        "edit_pro_ref_target": ("edit_int_key", "pro_ref_target", "Pro Plan အတွက် လိုအပ်မည့် ဖိတ်ခေါ်သူ အရေအတွက် ရိုက်ထည့်ပါ (ဥပမာ- 12):"),
+        "edit_vip_ref_target": ("edit_int_key", "vip_ref_target", "VIP Plan အတွက် လိုအပ်မည့် ဖိတ်ခေါ်သူ အရေအတွက် ရိုက်ထည့်ပါ (ဥပမာ- 20):"),
+        "edit_notif_welcome": ("edit_notif_key", "welcome", "Welcome Notification စာသားအသစ် ရိုက်ထည့်ပါ:"),
+        "edit_notif_support_prompt": ("edit_notif_key", "support_prompt", "Support Prompt စာသားအသစ် ရိုက်ထည့်ပါ:"),
+        "edit_notif_plan_update": ("edit_notif_key", "plan_update", "Plan Update Notification စာသားအသစ် ရိုက်ထည့်ပါ:"),
+        "start_broadcast": ("broadcast_msg", None, "📢 User များထံ ပို့လိုသော Notification / Broadcast မက်ဆေ့ချ် ရိုက်ထည့်ပါ:"),
+        "uc_inspect_user": ("uc_inspect", None, "🔍 စစ်ဆေးလိုသော User ID ကို ရိုက်ထည့်ပါ:"),
+        "uc_ban_user": ("uc_ban", None, "🚫 Ban လုပ်လိုသော User ID ကို ရိုက်ထည့်ပါ:"),
+        "uc_unban_user": ("uc_unban", None, "✅ Unban လုပ်လိုသော User ID ကို ရိုက်ထည့်ပါ:"),
+        "uc_set_plan": ("uc_pick_plan", None, "📦 Plan ပြောင်းလဲလိုသော User ID ကို ရိုက်ထည့်ပါ:"),
+        "uc_set_app_link": ("uc_app_link", None, "🔗 App Link သတ်မှတ်ရန် <code>USER_ID APP_ACCOUNT_ID</code> (သို့မဟုတ် <code>USER_ID unlink</code>) ပုံစံဖြင့် ရိုက်ထည့်ပါ:"),
+    }
+
+    if data in prompt_map:
+        action, key, prompt_msg = prompt_map[data]
+        USER_STATES[uid] = {"action": action, "key": key}
+        bot.send_message(chat_id, f"{prompt_msg}\n\n(ပယ်ဖျက်ရန် <code>/cancel</code> ရိုက်ပါ)")
