@@ -522,3 +522,296 @@ def reply_from_topic_to_user(message):
         bot.reply_to(message, "✅ User ထံ ပြန်ပို့ပြီးပါပြီ။")
     except Exception as e:
         bot.reply_to(message, f"⚠️ User ထံ ပို့မရပါ: {e}")    
+# ==================== PLAN PURCHASE FLOW ====================
+@bot.message_handler(func=lambda msg: msg.text == "💎 Buy Plan")
+def handle_buy_plan(message):
+    uid = message.from_user.id
+    register_known_user(uid)
+    st = bot_data["settings"]
+
+    pro_ks = get_pro_price_ks()
+    ref_cnt = get_referral_count(uid)
+    discount_per = get_referral_discount_per_user()
+    discount_ks = min(pro_ks, ref_cnt * discount_per)
+    final_pro_ks = max(0, pro_ks - discount_ks)
+
+    pro_line = f"{st.get('pro_price')}"
+    if discount_ks > 0:
+        pro_line += f"\n   ↳ 🎁 Referral Discount: <b>-{discount_ks:,} Ks</b> ({ref_cnt} ယောက်) → <b>{final_pro_ks:,} Ks</b>"
+
+    msg_text = (
+        "💎 <b>Plan များ ဝယ်ယူရန် ငွေလွှဲအကောင့်များ</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"👑 <b>Pro Plan:</b> {pro_line}\n"
+        f"⚡ <b>VIP Plan:</b> {st.get('vip_price')}\n\n"
+        "💳 <b>KPay:</b>\n"
+        f"• နံပါတ်: <code>{st.get('kpay_phone')}</code>\n"
+        f"• အမည်: {st.get('kpay_name')}\n\n"
+        "🌊 <b>WavePay:</b>\n"
+        f"• နံပါတ်: <code>{st.get('wave_phone')}</code>\n"
+        f"• အမည်: {st.get('wave_name')}\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        "ငွေလွှဲပြီးပါက App ထဲတွင် ဖွင့်ထားသော <b>သင့်အကောင့် Email</b> ကို အောက်တွင် ရိုက်ထည့်ပေးပါ-"
+    )
+    user_states[uid] = {"step": "WAITING_EMAIL"}
+    bot.send_message(message.chat.id, msg_text)
+
+@bot.message_handler(func=lambda msg: user_states.get(msg.from_user.id, {}).get("step") == "WAITING_EMAIL")
+def handle_user_email(message):
+    email = message.text.strip()
+    if "@" not in email or "." not in email:
+        bot.reply_to(message, "Email ပုံစံ မှားယွင်းနေပါသည်။ သေချာစွာ ပြန်လည်ရိုက်ထည့်ပေးပါ:")
+        return
+
+    user_states[message.from_user.id] = {
+        "step": "WAITING_SLIP",
+        "email": email
+    }
+    bot.send_message(
+        message.chat.id,
+        f"✅ Email <code>{email}</code> ကို မှတ်သားထားပါသည်။\n\nကျေးဇူးပြု၍ <b>ငွေလွှဲပြေစာ (Screenshot/Photo)</b> ကို ပို့ပေးပါ-"
+    )
+
+@bot.message_handler(content_types=['photo'], func=lambda msg: user_states.get(msg.from_user.id, {}).get("step") == "WAITING_SLIP")
+def handle_user_slip(message):
+    user_id = message.from_user.id
+    email = user_states[user_id]["email"]
+    photo_id = message.photo[-1].file_id
+
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        types.InlineKeyboardButton("✅ Approve PRO", callback_data=f"app_PRO_{user_id}_{email}"),
+        types.InlineKeyboardButton("🌟 Approve VIP", callback_data=f"app_VIP_{user_id}_{email}"),
+        types.InlineKeyboardButton("❌ ငွေမလုံလောက်", callback_data=f"rej_insuf_{user_id}"),
+        types.InlineKeyboardButton("🚫 Spam/Fake", callback_data=f"rej_spam_{user_id}")
+    )
+
+    caption = (
+        f"📩 <b>ငွေလွှဲစလစ် အသစ်ရောက်ရှိပါသည်</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━\n"
+        f"• User: {message.from_user.full_name} (@{message.from_user.username or 'none'})\n"
+        f"• Telegram ID: <code>{user_id}</code>\n"
+        f"• App Email: <code>{email}</code>\n"
+        f"• Time: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}"
+    )
+
+    if ADMIN_GROUP_ID != 0:
+        bot.send_photo(
+            chat_id=ADMIN_GROUP_ID,
+            photo=photo_id,
+            caption=caption,
+            reply_markup=markup
+        )
+        tmpl = bot_data["messages"].get("slip_submitted", DEFAULT_MESSAGES["slip_submitted"])
+        bot.reply_to(message, tmpl, reply_markup=main_menu_keyboard(user_id))
+    else:
+        bot.reply_to(message, "⚠️ Admin Group ID မသတ်မှတ်ရသေးပါ။ Owner ထံ ဆက်သွယ်ပါ။")
+
+    user_states.pop(user_id, None)
+
+# ==================== ADMIN ACTIONS CALLBACK ====================
+@bot.callback_query_handler(func=lambda call: call.data.startswith(("app_", "rej_")))
+def handle_admin_callback(call):
+    data = call.data.split("_")
+    action = data[0]
+
+    if action == "app":
+        plan = data[1]
+        uid = int(data[2])
+        email = data[3]
+
+        bot.answer_callback_query(call.id, f"Updating {plan} in App...")
+
+        res = call_subscription_webhook(email=email, plan=plan, duration_days=30)
+
+        if res["success"]:
+            expiry = res["data"].get("expiryDate", "30 Days")
+            bot.edit_message_caption(
+                chat_id=call.message.chat.id,
+                message_id=call.message.message_id,
+                caption=f"{call.message.caption}\n\n✅ <b>APPROVED ({plan}) by @{call.from_user.username}</b>\nExpiry: {expiry}",
+                reply_markup=None
+            )
+            try:
+                tmpl = bot_data["messages"].get("approve_user", DEFAULT_MESSAGES["approve_user"])
+                approval_msg = tmpl.format(
+                    email=email,
+                    plan=plan,
+                    expiry=expiry
+                )
+                bot.send_message(uid, approval_msg)
+            except Exception:
+                pass
+        else:
+            bot.send_message(call.message.chat.id, f"⚠️ Webhook Error: {res.get('error')}")
+
+    elif action == "rej":
+        reason = data[1]
+        uid = int(data[2])
+
+        if reason == "insuf":
+            bot.edit_message_caption(
+                chat_id=call.message.chat.id,
+                message_id=call.message.message_id,
+                caption=f"{call.message.caption}\n\n❌ <b>REJECTED (ငွေမလုံလောက်) by @{call.from_user.username}</b>",
+                reply_markup=None
+            )
+            try:
+                tmpl = bot_data["messages"].get("reject_user", DEFAULT_MESSAGES["reject_user"])
+                bot.send_message(uid, tmpl)
+            except Exception:
+                pass
+        elif reason == "spam":
+            if uid not in bot_data["banned_users"]:
+                bot_data["banned_users"].append(uid)
+                save_data(bot_data)
+            bot.edit_message_caption(
+                chat_id=call.message.chat.id,
+                message_id=call.message.message_id,
+                caption=f"{call.message.caption}\n\n🚫 <b>USER BANNED (Spam/Fake) by @{call.from_user.username}</b>",
+                reply_markup=None
+            )
+
+# ==================== OWNER PANEL ====================
+@bot.message_handler(func=lambda msg: msg.text == "⚙️ Owner Menu")
+def handle_owner_menu(message):
+    if message.from_user.id != OWNER_ID:
+        return
+    register_known_user(message.from_user.id)
+    bot.send_message(message.chat.id, "⚙️ <b>Owner Control Panel</b>\nအောက်ပါ ဆက်တင်များကို ပြင်ဆင်နိုင်ပါသည်-", reply_markup=owner_inline_keyboard())
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("owner_"))
+def handle_owner_actions(call):
+    if call.from_user.id != OWNER_ID:
+        bot.answer_callback_query(call.id, "Unauthorized", show_alert=True)
+        return
+
+    action = call.data.replace("owner_", "")
+    st = bot_data["settings"]
+
+    if action == "view_settings":
+        req_cnt = get_required_referrals_for_free_pro()
+        txt = (
+            "⚙️ <b>လက်ရှိ ဆက်တင်များ</b>\n"
+            "━━━━━━━━━━━━━━━━━━━\n"
+            f"• KPay: {st.get('kpay_phone')} ({st.get('kpay_name')})\n"
+            f"• Wave: {st.get('wave_phone')} ({st.get('wave_name')})\n"
+            f"• Pro Price: {st.get('pro_price')}\n"
+            f"• VIP Price: {st.get('vip_price')}\n"
+            f"• Referral Discount: <b>{get_referral_discount_per_user():,} Ks</b> / ယောက် (Free PRO = {req_cnt} ယောက်)\n"
+            f"• Support: @{st.get('support_username')}\n"
+            f"• Known Users: {len(bot_data.get('known_users', []))} ယောက်\n"
+            f"• Banned Users: {len(bot_data.get('banned_users', []))} ယောက်"
+        )
+        bot.send_message(call.message.chat.id, txt)
+        bot.answer_callback_query(call.id)
+    elif action == "broadcast":
+        user_states[OWNER_ID] = {"step": "OWNER_BROADCAST"}
+        bot.send_message(call.message.chat.id, "📢 User အားလုံးဆီ ပို့မည့် <b>အသိပေးချက် မက်ဆေ့ခ်ျ</b> ကို ရိုက်ထည့်ပေးပါ:")
+        bot.answer_callback_query(call.id)
+    else:
+        field_map = {
+            "set_kpay": ("KPay (ဖုန်းနံပါတ် နှင့် အမည်)", "kpay"),
+            "set_wave": ("Wave (ဖုန်းနံပါတ် နှင့် အမည်)", "wave"),
+            "set_pro_price": ("Pro Plan ဈေးနှုန်း (ဥပမာ: 3,000 Ks / 1 Month)", "pro_price"),
+            "set_vip_price": ("VIP Plan ဈေးနှုန်း", "vip_price"),
+            "set_ref_discount": ("ဖိတ်ခေါ်သူတစ်ဦးလျှင် လျှော့ပေးမည့် ပမာဏ (ဂဏန်းသီးသန့်၊ ဥပမာ: 250)", "ref_discount"),
+            "set_support": ("Support Telegram Username (without @)", "support_username"),
+            "edit_welcome": ("Welcome Message\nVariables များ: {first_name}, {full_name}", "welcome"),
+            "edit_ref_notify": ("Referral Notify Message\nVariables များ: {invited_name}, {ref_count}", "referral_notify"),
+            "edit_approve": ("Approve Message\nVariables များ: {email}, {plan}, {expiry}", "approve_user"),
+            "edit_reject": ("Reject Message", "reject_user"),
+            "edit_slip": ("Slip Submitted Message", "slip_submitted")
+        }
+        if action in field_map:
+            label, key = field_map[action]
+            user_states[OWNER_ID] = {"step": f"EDIT_{key}"}
+            bot.send_message(call.message.chat.id, f"📝 <b>{label}</b> အသစ်ကို ရိုက်ထည့်ပေးပါ:")
+            bot.answer_callback_query(call.id)
+
+@bot.message_handler(
+    func=lambda msg: msg.from_user.id == OWNER_ID
+    and (
+        user_states.get(OWNER_ID, {}).get("step", "").startswith("EDIT_")
+        or user_states.get(OWNER_ID, {}).get("step") == "OWNER_BROADCAST"
+    )
+)
+def handle_owner_input(message):
+    step = user_states[OWNER_ID]["step"]
+    text = message.text.strip()
+    st = bot_data["settings"]
+
+    if step == "OWNER_BROADCAST":
+        user_states.pop(OWNER_ID, None)
+        sent_ok = 0
+        failed = 0
+        banned_set = set(bot_data.get("banned_users", []))
+        for uid in list(bot_data.get("known_users", [])):
+            if int(uid) in banned_set:
+                continue
+            try:
+                bot.send_message(
+                    int(uid),
+                    f"📢 <b>အသိပေးချက်အသစ်</b>\n━━━━━━━━━━━━━━━━━━━\n{message.text}"
+                )
+                sent_ok += 1
+            except Exception:
+                failed += 1
+        bot.reply_to(message, f"✅ Broadcast ပို့ပြီးပါပြီ။\n• အောင်မြင်: <b>{sent_ok}</b> ယောက်\n• မအောင်မြင်: <b>{failed}</b> ယောက်")
+        return
+
+    if step.startswith("EDIT_"):
+        field = step.replace("EDIT_", "")
+        if field in DEFAULT_SETTINGS:
+            if field == "kpay":
+                parts = text.split()
+                st["kpay_phone"] = parts[0]
+                st["kpay_name"] = " ".join(parts[1:]) if len(parts) > 1 else ""
+            elif field == "wave":
+                parts = text.split()
+                st["wave_phone"] = parts[0]
+                st["wave_name"] = " ".join(parts[1:]) if len(parts) > 1 else ""
+            elif field == "pro_price":
+                st["pro_price"] = text
+            elif field == "vip_price":
+                st["vip_price"] = text
+            elif field == "referral_discount":
+                digits = "".join(ch for ch in text if ch.isdigit())
+                if not digits:
+                    bot.reply_to(message, "ဂဏန်းသီးသန့် ရိုက်ထည့်ပေးပါ (ဥပမာ: 250)။")
+                    return
+                st["referral_discount"] = int(digits)
+            elif field == "support_username":
+                st["support_username"] = text.replace("@", "")
+            save_data(bot_data)
+            user_states.pop(OWNER_ID, None)
+            bot.reply_to(message, f"✅ <b>{field}</b> ဆက်တင်ကို အောင်မြင်စွာ ပြောင်းလဲသိမ်းဆည်းပြီးပါပြီ။")
+            return
+        
+        elif field in DEFAULT_MESSAGES:
+            bot_data["messages"][field] = text
+            save_data(bot_data)
+            user_states.pop(OWNER_ID, None)
+            bot.reply_to(message, f"✅ <b>{field}</b> မက်ဆေ့ခ်ျ ပုံစံအသစ်ကို သိမ်းဆည်းပြီးပါပြီ။")
+            return
+
+# ==================== RENDER HELPER SERVER ====================
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain")
+        self.end_headers()
+        self.wfile.write(b"AYK Bot is alive!")
+
+def run_health_server():
+    server = HTTPServer(("0.0.0.0", PORT), HealthCheckHandler)
+    print(f"Health server started on port {PORT}")
+    server.serve_forever()
+
+# ==================== MAIN EXECUTION ====================
+if __name__ == "__main__":
+    print("Starting Health Server...")
+    threading.Thread(target=run_health_server, daemon=True).start()
+
+    print("Starting Telegram Bot Polling...")
+    bot.infinity_polling(skip_pending=True)
