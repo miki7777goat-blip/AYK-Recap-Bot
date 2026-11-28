@@ -6,7 +6,68 @@ from datetime import datetime, timezone
 import requests
 import telebot
 from telebot import types
+import json
+import os
+from supabase import create_client, Client
 
+SUPABASE_URL = os.environ["SUPABASE_URL"]
+SUPABASE_KEY = os.environ["SUPABASE_KEY"]
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+FIELD_MAP = {
+    "edit_welcome": "welcome_message",
+    "edit_ref_info": "ref_info_msg",
+    "edit_ref_notify": "ref_notify_msg",
+    "edit_approve_msg": "approve_msg",
+    "edit_reject_msg": "reject_msg",
+    "edit_slip_msg": "slip_msg",
+    "edit_custom_notices": "custom_notices",
+}
+
+
+def get_main_config() -> dict:
+    """bot_config table ထဲက main_config row ရဲ့ data ကို dict အဖြစ် ပြန်ထုတ်ပေးသည်။"""
+    res = (
+        supabase.table("bot_config")
+        .select("data")
+        .eq("id", "main_config")
+        .single()
+        .execute()
+    )
+    raw = res.data.get("data") if res.data else {}
+
+    if raw is None or raw == "":
+        return {}
+    if isinstance(raw, dict):
+        return dict(raw)
+    if isinstance(raw, str):
+        try:
+            parsed = json.loads(raw)
+            return dict(parsed) if isinstance(parsed, dict) else {}
+        except json.JSONDecodeError:
+            return {}
+    return {}
+
+
+def update_main_config_field(field_key: str, new_value: str) -> dict:
+    """Bot မှာ edit လုပ်လိုက်တဲ့ value ကို main_config ရဲ့ data ထဲမှာ update လုပ်သည်။"""
+    current_data = get_main_config()
+    current_data[field_key] = new_value
+
+    # data column က text ဖြစ်နေရင် JSON string အဖြစ် သိမ်းပြီး၊ jsonb ဖြစ်ရင် dict အတိုင်း သိမ်းသည်
+    res = (
+        supabase.table("bot_config")
+        .select("data")
+        .eq("id", "main_config")
+        .single()
+        .execute()
+    )
+    existing_raw = res.data.get("data") if res.data else None
+    payload_value = json.dumps(current_data, ensure_ascii=False) if isinstance(existing_raw, str) else current_data
+
+    supabase.table("bot_config").update({"data": payload_value}).eq("id", "main_config").execute()
+    return current_data
+    
 # ==================== ENVIRONMENT VARIABLES ====================
 BOT_TOKEN = os.getenv("BOT_TOKEN", "8909534863:AAEck21ljGacrRR_e4mUZQmGKqeH4tVAqwU")
 OWNER_ID = int(os.getenv("OWNER_ID", "8415289516"))
