@@ -713,3 +713,219 @@ def handle_callbacks(call: telebot.types.CallbackQuery):
         action, key, prompt_msg = prompt_map[data]
         USER_STATES[uid] = {"action": action, "key": key}
         bot.send_message(chat_id, f"{prompt_msg}\n\n(ပယ်ဖျက်ရန် <code>/cancel</code> ရိုက်ပါ)")
+# --- အပိုင်း (၅): Text Input, Broadcast, Commands & Bot Polling Runner ---
+@bot.message_handler(commands=["cancel"])
+def handle_cancel(message: telebot.types.Message):
+    uid = message.from_user.id
+    USER_STATES.pop(uid, None)
+    bot.send_message(
+        message.chat.id,
+        "❌ လုပ်ဆောင်ချက်ကို ပယ်ဖျက်လိုက်ပါပြီ။",
+        reply_markup=build_main_menu_keyboard(uid),
+    )
+
+
+@bot.message_handler(func=lambda m: True, content_types=["text"])
+def handle_text_input(message: telebot.types.Message):
+    uid = message.from_user.id
+    chat_id = message.chat.id
+    text_in = (message.text or "").strip()
+
+    username = message.from_user.username or ""
+    full_name = " ".join(
+        filter(None, [message.from_user.first_name, message.from_user.last_name])
+    )
+    register_or_update_user(uid, username=username, full_name=full_name)
+    cfg = get_config()
+
+    if _is_banned(cfg, uid):
+        bot.send_message(chat_id, "🚫 သင့်အကောင့်ကို ပိတ်ပင်ထားပါသည်။")
+        return
+
+    state = USER_STATES.get(uid)
+    if not state:
+        bot.send_message(
+            chat_id,
+            "Menu ကို ဖွင့်ရန် <code>/start</code> (သို့မဟုတ်) ခလုတ်များကို အသုံးပြုပါ။",
+            reply_markup=build_main_menu_keyboard(uid),
+        )
+        return
+
+    action = state.get("action")
+    key = state.get("key")
+
+    # --- User Flows ---
+    if action == "user_link_app_input":
+        USER_STATES.pop(uid, None)
+        if text_in.lower() == "unlink":
+            ok, _ = set_user_app_link(uid, False, "")
+            msg = "✅ App ချိတ်ဆက်မှုကို ဖြုတ်လိုက်ပါပြီ။" if ok else "❌ သိမ်းဆည်းရာတွင် အမှားဖြစ်ပွားပါသည်။"
+        else:
+            ok, _ = set_user_app_link(uid, True, text_in)
+            msg = (
+                f"✅ App Account ID <code>{text_in}</code> နှင့် ချိတ်ဆက်ပြီးပါပြီ။"
+                if ok
+                else "❌ သိမ်းဆည်းရာတွင် အမှားဖြစ်ပွားပါသည်။"
+            )
+        bot.send_message(chat_id, msg, reply_markup=build_main_menu_keyboard(uid))
+        return
+
+    if action == "user_support_msg":
+        USER_STATES.pop(uid, None)
+        if OWNER_ID != 0:
+            try:
+                uname_str = f"@{username}" if username else "no_username"
+                bot.send_message(
+                    OWNER_ID,
+                    f"📩 <b>Support Message</b>\n• From: <code>{uid}</code> ({uname_str})\n• Name: <code>{full_name}</code>\n\n{text_in}",
+                )
+            except Exception as e:
+                logger.error(f"Forward support msg failed: {e}")
+        bot.send_message(
+            chat_id,
+            "✅ သင့်မက်ဆေ့ချ်ကို Admin ထံ ပေးပို့ပြီးပါပြီ။",
+            reply_markup=build_main_menu_keyboard(uid),
+        )
+        return
+
+    # --- Owner Only Flows ---
+    if not _is_owner(uid):
+        USER_STATES.pop(uid, None)
+        bot.send_message(chat_id, "⛔ Owner သာ လုပ်ဆောင်နိုင်ပါသည်။")
+        return
+
+    if action == "edit_config_key" and key:
+        USER_STATES.pop(uid, None)
+        if update_config_key(key, text_in):
+            bot.send_message(
+                chat_id,
+                f"✅ <code>{key}</code> ကို အောင်မြင်စွာ ပြင်ဆင်သိမ်းဆည်းပြီးပါပြီ။",
+                reply_markup=build_owner_panel_keyboard(get_config()),
+            )
+        else:
+            bot.send_message(chat_id, "❌ Supabase ထဲ သိမ်းဆည်းရာတွင် အမှားဖြစ်ပွားပါသည်။")
+        return
+
+    if action == "edit_int_key" and key:
+        if not text_in.isdigit() or int(text_in) <= 0:
+            bot.send_message(chat_id, "⚠️ 0 ထက်ကြီးသော ဂဏန်းသက်သက် ရိုက်ထည့်ပေးပါ။")
+            return
+        USER_STATES.pop(uid, None)
+        val = int(text_in)
+        if update_config_key(key, val):
+            bot.send_message(
+                chat_id,
+                f"✅ <code>{key}</code> ကို <code>{val}</code> ဟု ပြင်ဆင်ပြီးပါပြီ။",
+                reply_markup=build_owner_panel_keyboard(get_config()),
+            )
+        else:
+            bot.send_message(chat_id, "❌ Supabase ထဲ သိမ်းဆည်းရာတွင် အမှားဖြစ်ပွားပါသည်။")
+        return
+
+    if action == "edit_notif_key" and key:
+        USER_STATES.pop(uid, None)
+        notifs = cfg.setdefault("notifications", {})
+        notifs[key] = text_in
+        if save_config(cfg):
+            bot.send_message(
+                chat_id,
+                f"✅ Notification (<code>{key}</code>) ကို သိမ်းဆည်းပြီးပါပြီ။",
+                reply_markup=build_notifications_menu_keyboard(),
+            )
+        else:
+            bot.send_message(chat_id, "❌ Notification သိမ်းဆည်းရာတွင် အမှားဖြစ်ပွားပါသည်။")
+        return
+
+    if action == "broadcast_msg":
+        USER_STATES.pop(uid, None)
+        users = cfg.get("users") or {}
+        sent_ok = 0
+        sent_fail = 0
+        for u_key, u_val in users.items():
+            if not u_key.isdigit():
+                continue
+            target_id = int(u_key)
+            if isinstance(u_val, dict) and u_val.get("banned"):
+                continue
+            try:
+                bot.send_message(target_id, f"📢 <b>Notification</b>\n\n{text_in}")
+                sent_ok += 1
+            except Exception:
+                sent_fail += 1
+        bot.send_message(
+            chat_id,
+            f"📢 Broadcast ပြီးစီးပါပြီ။\n• ပို့ပြီး: <code>{sent_ok}</code> ယောက်\n• မရောက်သေး/ပိတ်ထား: <code>{sent_fail}</code> ယောက်",
+            reply_markup=build_owner_panel_keyboard(get_config()),
+        )
+        return
+
+    if action in ("uc_inspect", "uc_ban", "uc_unban", "uc_pick_plan"):
+        if not text_in.isdigit():
+            bot.send_message(chat_id, "⚠️ မှန်ကန်သော User ID (ဂဏန်း) ရိုက်ထည့်ပေးပါ။")
+            return
+        target_uid = int(text_in)
+        USER_STATES.pop(uid, None)
+
+        if action == "uc_inspect":
+            bot.send_message(
+                chat_id,
+                format_user_detail(cfg, target_uid),
+                reply_markup=build_user_control_keyboard(),
+            )
+        elif action == "uc_ban":
+            ok, _ = set_user_ban(target_uid, True)
+            bot.send_message(
+                chat_id,
+                f"🚫 User <code>{target_uid}</code> ကို Ban လုပ်ပြီးပါပြီ။" if ok else "❌ Ban လုပ်ရာတွင် အမှားဖြစ်ပွားပါသည်။",
+                reply_markup=build_user_control_keyboard(),
+            )
+        elif action == "uc_unban":
+            ok, _ = set_user_ban(target_uid, False)
+            bot.send_message(
+                chat_id,
+                f"✅ User <code>{target_uid}</code> ကို Unban ပြန်ဖွင့်ပြီးပါပြီ။" if ok else "❌ Unban လုပ်ရာတွင် အမှားဖြစ်ပွားပါသည်။",
+                reply_markup=build_user_control_keyboard(),
+            )
+        elif action == "uc_pick_plan":
+            bot.send_message(
+                chat_id,
+                f"📦 User <code>{target_uid}</code> အတွက် Plan ရွေးချယ်ပါ:\n\n{format_user_detail(cfg, target_uid)}",
+                reply_markup=build_plan_select_keyboard(target_uid),
+            )
+        return
+
+    if action == "uc_app_link":
+        parts = text_in.split(maxsplit=1)
+        if len(parts) < 2 or not parts[0].isdigit():
+            bot.send_message(
+                chat_id,
+                "⚠️ ပုံစံမှန် ရိုက်ထည့်ပါ — ဥပမာ: <code>123456789 APP_ID_01</code> သို့မဟုတ် <code>123456789 unlink</code>",
+            )
+            return
+        target_uid = int(parts[0])
+        arg2 = parts[1].strip()
+        USER_STATES.pop(uid, None)
+
+        if arg2.lower() == "unlink":
+            ok, _ = set_user_app_link(target_uid, False, "")
+            status_txt = f"🔗 User <code>{target_uid}</code> ရဲ့ App ချိတ်ဆက်မှု ဖြုတ်ပြီးပါပြီ။"
+        else:
+            ok, _ = set_user_app_link(target_uid, True, arg2)
+            status_txt = f"🔗 User <code>{target_uid}</code> ကို App Account <code>{arg2}</code> နှင့် ချိတ်ဆက်ပြီးပါပြီ။"
+
+        bot.send_message(
+            chat_id,
+            (status_txt if ok else "❌ App Link သိမ်းဆည်းရာတွင် အမှားဖြစ်ပွားပါသည်။")
+            + f"\n\n{format_user_detail(get_config(), target_uid)}",
+            reply_markup=build_user_control_keyboard(),
+        )
+        return
+
+
+def main():
+    logger.info("Bot is starting with Supabase config...")
+    bot.infinity_polling(skip_pending=True)
+
+
+if __name__ == "__main__":
+    main()
