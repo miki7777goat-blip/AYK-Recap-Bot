@@ -1,556 +1,172 @@
-"""
-AYK Recap Bot — aiogram v3 + Supabase (aiohttp REST) backend.
-
-Environment variables (loaded from .env or the process env):
-    BOT_TOKEN      — Telegram bot token (required)
-    OWNER_ID       — integer Telegram user id of the bot owner (recommended)
-    SUPABASE_URL   — Supabase project URL
-    SUPABASE_KEY   — Supabase API key (secret / service role)
-
-Falls back to the project defaults only if env vars are missing, so that
-the bot boots out-of-the-box for a quick demo. For production, ALWAYS
-provide them via environment variables.
-"""
-
-from __future__ import annotations
-
-import asyncio
-import logging
 import os
-import sys
+import json
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from datetime import datetime, timezone
-from typing import Any
+import requests
+import telebot
+from telebot import types
 
-import aiohttp
-from aiogram import Bot, Dispatcher, F, Router
-from aiogram.client.default import DefaultBotProperties
-from aiogram.enums import ParseMode
-from aiogram.exceptions import TelegramBadRequest
-from aiogram.filters import Command, CommandStart
-from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import State, StatesGroup
-from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import (
-    BotCommand,
-    CallbackQuery,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-    KeyboardButton,
-    Message,
-    ReplyKeyboardMarkup,
+# ==================== ENVIRONMENT VARIABLES ====================
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8909534863:AAEck21ljGacrRR_e4mUZQmGKqeH4tVAqwU")
+OWNER_ID = int(os.getenv("OWNER_ID", "8415289516"))  # Owner ၏ Telegram Chat ID (ဂဏန်းသီးသန့်)
+ADMIN_GROUP_ID = int(os.getenv("ADMIN_GROUP_ID", "-1004448651266"))  # အဓိက Admin Group ID
+SUPPORT_TOPIC_ID = int(os.getenv("SUPPORT_TOPIC_ID", "99"))  # User များနှင့် အမေးအဖြေလုပ်မည့် Topic ID
+
+WEBHOOK_URL = os.getenv(
+    "WEBHOOK_URL",
+    "https://aykrecaptool.lovable.app/api/public/subscription/update"
 )
-from dotenv import load_dotenv
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "OSv2efvHvWGB6b4l6jGsr87IZvyYLhMcH5V2YHuHgvSWKpJt")
+PORT = int(os.getenv("PORT", "10000"))  # Render အတွက် Port
 
-# --------------------------------------------------------------------------- #
-#  Configuration
-# --------------------------------------------------------------------------- #
-load_dotenv()
+bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)-7s | %(name)s | %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
-logger = logging.getLogger("ayk-bot")
+# ==================== DATA PERSISTENCE ====================
+DATA_FILE = "bot_data.json"
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
+DEFAULT_DATA = {
+    "settings": {
+        "kpay_phone": "09xxxxxxxxx",
+        "kpay_name": "Owner Name",
+        "wave_phone": "09xxxxxxxxx",
+        "wave_name": "Owner Name",
+        "pro_price": "3,000 Ks / 1 Month",
+        "vip_price": "25,000 Ks / 1 Month",
+        "support_username": "mikef07",
+        "referral_discount": 250  # ဖိတ်ခေါ်သူတစ်ဦးလျှင် လျှော့ပေးမည့် ပမာဏ (Ks)
+    },
+    "banned_users": [],
+    "known_users": [],     # Broadcast ပို့ရန် မှတ်သားထားသော User ID များ
+    "referrals": {},       # { referred_user_id: referrer_user_id }
+    "referral_counts": {}  # { referrer_user_id: active_count }
+}
 
-_owner_raw = os.getenv("OWNER_ID", "").strip()
-try:
-    OWNER_ID: int = int(_owner_raw) if _owner_raw else 0
-except ValueError:
-    OWNER_ID = 0
-    logger.warning("OWNER_ID=%r is not a valid integer; owner features disabled", _owner_raw)
 
-SUPABASE_URL = os.getenv("SUPABASE_URL", "https://tcyqlwzgvocjwtyqbxsp.supabase.co").rstrip("/")
-SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
+def parse_amount_ks(price_str: str, fallback: int = 3000) -> int:
+    digits = "".join(ch for ch in str(price_str) if ch.isdigit())
+    return int(digits) if digits else fallback
 
-if not BOT_TOKEN:
-    logger.critical("BOT_TOKEN is not set. Aborting.")
-    sys.exit(1)
-if not OWNER_ID:
-    logger.warning("OWNER_ID is not set — /admin and admin buttons will be disabled.")
 
-BOT_USERNAME: str = ""  # filled in at startup
-
-# --------------------------------------------------------------------------- #
-#  Supabase client (aiohttp REST)
-# --------------------------------------------------------------------------- #
-class Supabase:
-    """Minimal async REST client for Supabase PostgREST."""
-
-    def __init__(self, url: str, key: str) -> None:
-        self.base = f"{url}/rest/v1"
-        self.key = key
-        self._session: aiohttp.ClientSession | None = None
-
-    # -- lifecycle --------------------------------------------------------- #
-    async def _get_session(self) -> aiohttp.ClientSession:
-        if self._session is None or self._session.closed:
-            self._session = aiohttp.ClientSession(
-                headers={
-                    "apikey": self.key,
-                    "Authorization": f"Bearer {self.key}",
-                    "Content-Type": "application/json",
-                },
-                timeout=aiohttp.ClientTimeout(total=15),
-            )
-        return self._session
-
-    async def close(self) -> None:
-        if self._session and not self._session.closed:
-            await self._session.close()
-
-    # -- helpers ----------------------------------------------------------- #
-    @staticmethod
-    def _count_from_headers(headers: Any) -> int:
-        content_range = headers.get("Content-Range", "") if headers else ""
-        if "/" in content_range:
-            try:
-                return int(content_range.rsplit("/", 1)[-1])
-            except ValueError:
-                return 0
-        return 0
-
-    # -- queries ----------------------------------------------------------- #
-    async def select(self, table: str, params: dict[str, str] | None = None) -> list[dict]:
+def load_data():
+    data = json.loads(json.dumps(DEFAULT_DATA))
+    if os.path.exists(DATA_FILE):
         try:
-            session = await self._get_session()
-            async with session.get(f"{self.base}/{table}", params=params or {}) as resp:
-                if resp.status >= 400:
-                    logger.error("Supabase select [%s] %s → %s", table, resp.status, await resp.text())
-                    return []
-                return await resp.json()
-        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
-            logger.error("Supabase select [%s] network error: %s", table, exc)
-            return []
-
-    async def upsert(
-        self,
-        table: str,
-        data: dict | list[dict],
-        on_conflict: str | None = None,
-    ) -> list[dict]:
-        try:
-            session = await self._get_session()
-            params = {"on_conflict": on_conflict} if on_conflict else {}
-            headers = {"Prefer": "resolution=merge-duplicates,return=representation"}
-            async with session.post(
-                f"{self.base}/{table}", json=data, params=params, headers=headers
-            ) as resp:
-                if resp.status >= 400:
-                    logger.error("Supabase upsert [%s] %s → %s", table, resp.status, await resp.text())
-                    return []
-                return await resp.json()
-        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
-            logger.error("Supabase upsert [%s] network error: %s", table, exc)
-            return []
-
-    async def count(self, table: str, params: dict[str, str] | None = None) -> int:
-        try:
-            session = await self._get_session()
-            headers = {"Prefer": "count=exact", "Range": "0-0"}
-            q = {"select": "user_id"}
-            if params:
-                q.update(params)
-            async with session.get(f"{self.base}/{table}", params=q, headers=headers) as resp:
-                if resp.status >= 400:
-                    return 0
-                return self._count_from_headers(resp.headers)
-        except (aiohttp.ClientError, asyncio.TimeoutError):
-            return 0
-
-    # -- domain helpers ---------------------------------------------------- #
-    async def get_user(self, user_id: int) -> dict | None:
-        rows = await self.select(
-            "users", {"user_id": f"eq.{user_id}", "select": "*", "limit": "1"}
-        )
-        return rows[0] if rows else None
-
-    async def upsert_user(self, user_id: int, **fields: Any) -> dict | None:
-        payload = {"user_id": user_id, **fields}
-        rows = await self.upsert("users", payload, on_conflict="user_id")
-        return rows[0] if rows else None
-
-    async def count_referrals(self, referrer_id: int) -> int:
-        return await self.count("users", {"referrer_id": f"eq.{referrer_id}"})
-
-    async def count_users(self) -> int:
-        return await self.count("users")
-
-    async def count_active_subs(self) -> int:
-        now = datetime.now(timezone.utc).isoformat()
-        return await self.count("users", {"subscription_until": f"gt.{now}"})
-
-    async def all_user_ids(self) -> list[int]:
-        rows = await self.select("users", {"select": "user_id"})
-        return [int(r["user_id"]) for r in rows if "user_id" in r]
-
-
-db = Supabase(SUPABASE_URL, SUPABASE_KEY)
-
-# --------------------------------------------------------------------------- #
-#  Auth helpers
-# --------------------------------------------------------------------------- #
-def is_owner(user_id: int | None) -> bool:
-    return bool(OWNER_ID) and user_id == OWNER_ID
-
-
-# --------------------------------------------------------------------------- #
-#  Keyboards
-# --------------------------------------------------------------------------- #
-def main_menu_kb(is_admin: bool = False) -> ReplyKeyboardMarkup:
-    rows = [
-        [KeyboardButton(text="👤 Profile"), KeyboardButton(text="📋 Plans")],
-        [KeyboardButton(text="🎁 Referral"), KeyboardButton(text="⚙️ Settings")],
-    ]
-    if is_admin:
-        rows.append([KeyboardButton(text="🔧 Admin Panel")])
-    return ReplyKeyboardMarkup(
-        keyboard=rows,
-        resize_keyboard=True,
-        is_persistent=True,
-        input_field_placeholder="Choose an option…",
-    )
-
-
-def plans_ikb() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="1 Month — $5", callback_data="sub:1m")],
-            [InlineKeyboardButton(text="3 Months — $12", callback_data="sub:3m")],
-            [InlineKeyboardButton(text="12 Months — $40", callback_data="sub:12m")],
-        ]
-    )
-
-
-def admin_ikb() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="📊 Stats", callback_data="admin:stats")],
-            [InlineKeyboardButton(text="👥 Recent Users", callback_data="admin:users")],
-            [InlineKeyboardButton(text="📢 Broadcast", callback_data="admin:broadcast")],
-        ]
-    )
-
-
-# --------------------------------------------------------------------------- #
-#  FSM states
-# --------------------------------------------------------------------------- #
-class AdminStates(StatesGroup):
-    waiting_broadcast = State()
-
-
-# --------------------------------------------------------------------------- #
-#  Router & utility
-# --------------------------------------------------------------------------- #
-router = Router()
-
-
-def fmt_dt(raw: str | None) -> str:
-    if not raw:
-        return "—"
-    try:
-        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
-        return dt.strftime("%Y-%m-%d %H:%M UTC")
-    except Exception:
-        return raw
-
-
-async def reply_with_menu(message: Message, text: str) -> None:
-    await message.answer(text, reply_markup=main_menu_kb(is_owner(message.from_user.id)))
-
-
-# --------------------------------------------------------------------------- #
-#  Basic commands
-# --------------------------------------------------------------------------- #
-@router.message(CommandStart())
-async def cmd_start(message: Message, state: FSMContext) -> None:
-    await state.clear()
-    user = message.from_user
-    if user is None:
-        return
-
-    # Referral parsing: /start ref_12345
-    referrer_id: int | None = None
-    parts = (message.text or "").split(maxsplit=1)
-    if len(parts) == 2 and parts[1].startswith("ref_"):
-        try:
-            candidate = int(parts[1][4:])
-            if candidate != user.id and await db.get_user(candidate):
-                referrer_id = candidate
-        except ValueError:
+            with open(DATA_FILE, "r", encoding="utf-8") as f:
+                loaded = json.load(f)
+            if isinstance(loaded, dict):
+                data["settings"].update(loaded.get("settings", {}))
+                data["banned_users"] = loaded.get("banned_users", [])
+                data["known_users"] = loaded.get("known_users", [])
+                data["referrals"] = loaded.get("referrals", {})
+                data["referral_counts"] = loaded.get("referral_counts", {})
+        except Exception:
             pass
-
-    existing = await db.get_user(user.id)
-    if existing is None:
-        await db.upsert_user(
-            user.id,
-            username=user.username,
-            first_name=user.first_name,
-            joined_at=datetime.now(timezone.utc).isoformat(),
-            referrer_id=referrer_id,
-            plan="free",
-        )
-    else:
-        await db.upsert_user(
-            user.id, username=user.username, first_name=user.first_name
-        )
-
-    await reply_with_menu(
-        message,
-        f"👋 Welcome, <b>{user.first_name or 'friend'}</b>!\n\n"
-        f"I'm <b>AYK Recap Bot</b>. Use the menu below to get started.",
-    )
+    return data
 
 
-@router.message(Command("menu"))
-async def cmd_menu(message: Message, state: FSMContext) -> None:
-    await state.clear()
-    await reply_with_menu(message, "🏠 <b>Main menu</b>")
-
-
-@router.message(Command("cancel"))
-async def cmd_cancel(message: Message, state: FSMContext) -> None:
-    await state.clear()
-    await reply_with_menu(message, "✅ Action cancelled.")
-
-
-# --------------------------------------------------------------------------- #
-#  Menu handlers
-# --------------------------------------------------------------------------- #
-@router.message(F.text == "👤 Profile")
-async def show_profile(message: Message, state: FSMContext) -> None:
-    await state.clear()
-    user = message.from_user
-    if user is None:
-        return
-    data = await db.get_user(user.id)
-    if not data:
-        await reply_with_menu(message, "⚠️ Profile not found. Please send /start.")
-        return
-    ref_count = await db.count_referrals(user.id)
-    text = (
-        "👤 <b>Your Profile</b>\n\n"
-        f"🆔 ID: <code>{user.id}</code>\n"
-        f"👤 Name: {user.first_name or '—'}\n"
-        f"🔗 Username: @{user.username or '—'}\n"
-        f"💼 Plan: <b>{data.get('plan') or 'free'}</b>\n"
-        f"📅 Valid until: {fmt_dt(data.get('subscription_until'))}\n"
-        f"🎁 Referrals: <b>{ref_count}</b>"
-    )
-    await reply_with_menu(message, text)
-
-
-@router.message(F.text == "📋 Plans")
-async def show_plans(message: Message, state: FSMContext) -> None:
-    await state.clear()
-    text = (
-        "📋 <b>Available Plans</b>\n\n"
-        "• <b>1 Month</b> — $5\n"
-        "• <b>3 Months</b> — $12 (save 20%)\n"
-        "• <b>12 Months</b> — $40 (best value)\n\n"
-        "Choose a plan:"
-    )
-    await message.answer(text, reply_markup=plans_ikb())
-    # Keep the persistent keyboard alive
-    await message.answer(
-        "Use the menu anytime 👇",
-        reply_markup=main_menu_kb(is_owner(message.from_user.id)),
-    )
-
-
-@router.message(F.text == "🎁 Referral")
-async def show_referral(message: Message, state: FSMContext) -> None:
-    await state.clear()
-    user = message.from_user
-    if user is None:
-        return
-    count = await db.count_referrals(user.id)
-    link = f"https://t.me/{BOT_USERNAME}?start=ref_{user.id}" if BOT_USERNAME else "—"
-    text = (
-        "🎁 <b>Referral Program</b>\n\n"
-        f"Your invite link:\n<code>{link}</code>\n\n"
-        f"👥 Invited friends: <b>{count}</b>"
-    )
-    await reply_with_menu(message, text)
-
-
-@router.message(F.text == "⚙️ Settings")
-async def show_settings(message: Message, state: FSMContext) -> None:
-    await state.clear()
-    await reply_with_menu(message, "⚙️ <b>Settings</b>\n\nComing soon.")
-
-
-# --------------------------------------------------------------------------- #
-#  Admin panel
-# --------------------------------------------------------------------------- #
-@router.message(F.text == "🔧 Admin Panel")
-async def show_admin(message: Message, state: FSMContext) -> None:
-    await state.clear()
-    if not is_owner(message.from_user.id):
-        await message.answer("⛔ Access denied.", reply_markup=main_menu_kb(False))
-        return
-    await message.answer("🔧 <b>Admin Panel</b>", reply_markup=admin_ikb())
-    await message.answer("Menu:", reply_markup=main_menu_kb(True))
-
-
-@router.callback_query(F.data.startswith("admin:"))
-async def handle_admin_cb(callback: CallbackQuery, state: FSMContext) -> None:
-    await callback.answer()
-    if not is_owner(callback.from_user.id):
-        return
-
-    action = callback.data.split(":", 1)[1]
-    message = callback.message
-
-    if action == "stats":
-        total = await db.count_users()
-        active = await db.count_active_subs()
-        text = (
-            "📊 <b>Bot Statistics</b>\n\n"
-            f"👥 Total users: <b>{total}</b>\n"
-            f"💎 Active subscribers: <b>{active}</b>"
-        )
-        if message:
-            await message.edit_text(text, reply_markup=admin_ikb())
-
-    elif action == "users":
-        rows = await db.select(
-            "users",
-            {"select": "user_id,first_name,username,plan,joined_at",
-             "order": "joined_at.desc.nullslast",
-             "limit": "20"},
-        )
-        if not rows:
-            text = "👥 No users yet."
-        else:
-            lines = ["👥 <b>Recent 20 users</b>\n"]
-            for r in rows:
-                lines.append(
-                    f"• <code>{r['user_id']}</code> — "
-                    f"{r.get('first_name') or '—'} "
-                    f"(@{r.get('username') or '—'}) · {r.get('plan') or 'free'}"
-                )
-            text = "\n".join(lines)
-        if message:
-            await message.edit_text(text, reply_markup=admin_ikb())
-
-    elif action == "broadcast":
-        await state.set_state(AdminStates.waiting_broadcast)
-        if message:
-            await message.answer(
-                "📢 <b>Broadcast mode</b>\n\nSend the message you want to deliver "
-                "to <i>every</i> user. Any content type is supported.\n\n"
-                "Type /cancel to abort."
-            )
-
-
-@router.message(AdminStates.waiting_broadcast)
-async def perform_broadcast(message: Message, state: FSMContext, bot: Bot) -> None:
-    if not is_owner(message.from_user.id):
-        await state.clear()
-        return
-
-    if (message.text or "").strip() == "/cancel":
-        await state.clear()
-        await reply_with_menu(message, "❌ Broadcast cancelled.")
-        return
-
-    await state.clear()
-    user_ids = await db.all_user_ids()
-    sent = failed = 0
-    for uid in user_ids:
-        try:
-            await bot.copy_message(
-                chat_id=uid,
-                from_chat_id=message.chat.id,
-                message_id=message.message_id,
-            )
-            sent += 1
-        except (TelegramBadRequest, Exception) as exc:  # noqa: BLE001
-            failed += 1
-            logger.debug("Broadcast to %s failed: %s", uid, exc)
-        await asyncio.sleep(0.05)  # ~20 msg/s, safe under TG limits
-
-    await reply_with_menu(
-        message, f"✅ Broadcast finished.\n\n✔️ Sent: <b>{sent}</b>\n❌ Failed: <b>{failed}</b>"
-    )
-
-
-# --------------------------------------------------------------------------- #
-#  Subscription callback
-# --------------------------------------------------------------------------- #
-@router.callback_query(F.data.startswith("sub:"))
-async def handle_sub(callback: CallbackQuery) -> None:
-    await callback.answer()
-    plan = callback.data.split(":", 1)[1]
-    await callback.message.answer(
-        f"📦 You selected the <b>{plan}</b> plan.\n\n"
-        "💳 Payment integration isn't wired up yet. "
-        "Please contact the owner to complete your subscription."
-    )
-
-
-# --------------------------------------------------------------------------- #
-#  Fallback (keeps keyboard persistent)
-# --------------------------------------------------------------------------- #
-@router.message()
-async def fallback(message: Message, state: FSMContext) -> None:
-    current = await state.get_state()
-    if current is not None:
-        return
-    await reply_with_menu(
-        message, "🤔 I didn't understand that. Pick an option from the menu 👇"
-    )
-
-
-# --------------------------------------------------------------------------- #
-#  Bootstrap
-# --------------------------------------------------------------------------- #
-async def on_startup(bot: Bot) -> None:
-    global BOT_USERNAME
-    me = await bot.get_me()
-    BOT_USERNAME = me.username or ""
+def save_data(data):
     try:
-        await bot.set_my_commands(
-            [
-                BotCommand(command="start", description="Start the bot"),
-                BotCommand(command="menu", description="Open main menu"),
-            ]
-        )
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("set_my_commands failed: %s", exc)
+        with open(DATA_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"Error saving data: {e}")
 
-    # Ensure no stale webhook conflicts with long polling
+
+def register_known_user(user_id: int):
+    uid_int = int(user_id)
+    if uid_int not in bot_data["known_users"]:
+        bot_data["known_users"].append(uid_int)
+        save_data(bot_data)
+
+
+def get_referral_count(user_id: int) -> int:
+    return int(bot_data["referral_counts"].get(str(user_id), 0))
+
+
+def get_referral_discount_per_user() -> int:
     try:
-        await bot.delete_webhook(drop_pending_updates=True)
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("delete_webhook failed: %s", exc)
-
-    logger.info("Bot @%s is up (owner_id=%s)", BOT_USERNAME or "?", OWNER_ID or "unset")
+        return max(0, int(bot_data["settings"].get("referral_discount", 250)))
+    except Exception:
+        return 250
 
 
-async def main() -> None:
-    bot = Bot(
-        token=BOT_TOKEN,
-        default=DefaultBotProperties(parse_mode=ParseMode.HTML),
-    )
-    dp = Dispatcher(storage=MemoryStorage())
-    dp.include_router(router)
+def get_pro_price_ks() -> int:
+    return parse_amount_ks(bot_data["settings"].get("pro_price", "3,000 Ks / 1 Month"), 3000)
 
-    dp.startup.register(on_startup)
+
+def get_required_referrals_for_free_pro() -> int:
+    discount_per = get_referral_discount_per_user()
+    if discount_per <= 0:
+        return 0
+    pro_ks = get_pro_price_ks()
+    return (pro_ks + discount_per - 1) // discount_per
+
+
+bot_data = load_data()
+user_states = {}  # In-memory user state handling
+
+
+# ==================== WEBHOOK INTEGRATION ====================
+def call_subscription_webhook(email: str, plan: str, duration_days: int = 30):
+    """App Backend သို့ Webhook ပို့၍ Plan ဖွင့်ပေးခြင်း"""
+    if not WEBHOOK_SECRET:
+        return {"success": False, "error": "WEBHOOK_SECRET is not configured"}
+
+    headers = {
+        "Content-Type": "application/json",
+        "X-Webhook-Secret": WEBHOOK_SECRET,
+    }
+    approval_time = datetime.now(timezone.utc).isoformat()
+    payload = {
+        "email": email.strip().lower(),
+        "plan": plan.upper(),
+        "status": "ACTIVE",
+        "startDate": approval_time,
+        "durationDays": duration_days
+    }
 
     try:
-        await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
-    finally:
-        await db.close()
-        await bot.session.close()
-        logger.info("Shutdown complete.")
+        res = requests.post(WEBHOOK_URL, headers=headers, json=payload, timeout=20)
+        data = res.json()
+        if res.status_code == 200 and data.get("ok"):
+            return {"success": True, "data": data}
+        return {"success": False, "error": data.get("error", f"HTTP {res.status_code}")}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
 
 
-if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except (KeyboardInterrupt, SystemExit):
-        logger.info("Stopped by user.")
+# ==================== KEYBOARDS ====================
+def main_menu_keyboard(user_id: int):
+    markup = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
+    markup.add(
+        types.KeyboardButton("👤 Profile"),
+        types.KeyboardButton("💎 Buy Plan"),
+        types.KeyboardButton("👥 Referral"),
+        types.KeyboardButton("💬 Chat with Admin"),
+        types.KeyboardButton("📞 Support")
+    )
+    if user_id == OWNER_ID:
+        markup.add(types.KeyboardButton("⚙️ Owner Menu"))
+    return markup
+
+
+def chat_exit_keyboard():
+    markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    markup.add(types.KeyboardButton("❌ Exit Chat"))
+    return markup
+
+
+def owner_inline_keyboard():
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        types.InlineKeyboardButton("💳 Edit KPay", callback_data="owner_set_kpay"),
+        types.InlineKeyboardButton("🌊 Edit Wave", callback_data="owner_set_wave"),
+        types.InlineKeyboardButton("💰 Edit Pro Price", callback_data="owner_set_pro_price"),
+        types.InlineKeyboardButton("👑 Edit VIP Price", callback_data="owner_set_vip_price"),
+        types.InlineKeyboardButton("🎁 Edit Ref Discount", callback_data="owner_set_ref_discount"),
+        types.InlineKeyboardButton("📞 Edit Support", callback_data="owner_set_support"),
+        types.InlineKeyboardButton("📢 Send Broadcast", callback_data="owner_broadcast"),
+        types.InlineKeyboardButton("📋 View Settings", callback_data="owner_view_settings")
+    )
+    return markup
