@@ -24,7 +24,7 @@ from aiogram.types import (
 # ==============================================================================
 # 1. CONFIGURATION (Hardcoded Topic ID 99)
 # ==============================================================================
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8909534863:AAH7HUrT_aRqaY7Kl7-eA_yDhnPVa6hUooo").strip()
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8909534863:AAEck21ljGacrRR_e4mUZQmGKqeH4tVAqwU").strip()
 if not BOT_TOKEN:
   raise RuntimeError("BOT_TOKEN environment variable is required.")
 
