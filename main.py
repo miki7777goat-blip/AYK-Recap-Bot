@@ -67,6 +67,97 @@ def update_main_config_field(field_key: str, new_value: str) -> dict:
 
     supabase.table("bot_config").update({"data": payload_value}).eq("id", "main_config").execute()
     return current_data
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.ext import ContextTypes
+
+OWNER_IDS = {8415289516}  # လိုအပ်ပါက Owner Telegram ID များ ထပ်ထည့်ပါ
+
+
+def get_extra_owner_rows() -> list[list[InlineKeyboardButton]]:
+    """ရှိပြီးသား Owner Menu row တွေနောက်မှာ ပေါင်းထည့်မယ့် ခလုတ်များ"""
+    return [
+        [
+            InlineKeyboardButton("👋 Edit Welcome", callback_data="edit_welcome"),
+            InlineKeyboardButton("👥 Edit Ref Info Msg", callback_data="edit_ref_info"),
+        ],
+        [
+            InlineKeyboardButton("🔔 Edit Ref Notify", callback_data="edit_ref_notify"),
+            InlineKeyboardButton("✅ Edit Approve Msg", callback_data="edit_approve_msg"),
+        ],
+        [
+            InlineKeyboardButton("❌ Edit Reject Msg", callback_data="edit_reject_msg"),
+            InlineKeyboardButton("📩 Edit Slip Msg", callback_data="edit_slip_msg"),
+        ],
+        [
+            InlineKeyboardButton("📢 Custom Notices", callback_data="edit_custom_notices"),
+        ],
+    ]
+
+
+def build_owner_keyboard(existing_rows: list[list[InlineKeyboardButton]]) -> InlineKeyboardMarkup:
+    """ရှိပြီးသား keyboard row တွေကို မပျက်စေဘဲ ခလုတ်အသစ်တွေ ပေါင်းထည့်ခြင်း"""
+    merged_rows = [list(row) for row in existing_rows] + get_extra_owner_rows()
+    return InlineKeyboardMarkup(merged_rows)
+
+
+async def handle_extra_owner_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """
+    ခလုတ်အသစ် ၇ ခုထဲက တစ်ခုခု နှိပ်ခံရရင် ကိုင်တွယ်မည့် function။
+    သက်ဆိုင်ရာ ခလုတ်ဖြစ်ရင် True ပြန်ပေးပြီး၊ ရှိပြီးသား တခြားခလုတ်ဖြစ်ရင် False ပြန်ပေးသည်။
+    """
+    query = update.callback_query
+    if not query or not query.data:
+        return False
+
+    user_id = query.from_user.id if query.from_user else 0
+    if user_id not in OWNER_IDS:
+        return False
+
+    callback_data = query.data
+    if callback_data not in FIELD_MAP:
+        return False
+
+    await query.answer()
+    field_key = FIELD_MAP[callback_data]
+    context.user_data["editing_config_key"] = field_key
+
+    cfg = get_main_config()
+    current_val = cfg.get(field_key, "(သတ်မှတ်ထားခြင်း မရှိသေးပါ)")
+
+    await query.message.reply_text(
+        f"✏️ <b>{field_key}</b> ကို ပြင်ဆင်ရန် စာသားအသစ် ရိုက်ပို့ပေးပါ။\n\n"
+        f"<b>လက်ရှိ စာသား:</b>\n{current_val}",
+        parse_mode="HTML",
+    )
+    return True
+
+
+async def handle_owner_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """
+    Owner က စာသားရိုက်ပို့လာတဲ့အခါ config field တစ်ခုခုကို edit လုပ်နေတာဆိုရင်
+    Supabase ထဲ ချက်ချင်း သိမ်းပေးမည့် function။
+    """
+    if not update.message or not update.message.text:
+        return False
+
+    user_id = update.effective_user.id if update.effective_user else 0
+    if user_id not in OWNER_IDS:
+        return False
+
+    editing_key = context.user_data.get("editing_config_key")
+    if not editing_key:
+        return False
+
+    new_text = update.message.text
+    update_main_config_field(editing_key, new_text)
+    context.user_data.pop("editing_config_key", None)
+
+    await update.message.reply_text(
+        f"✅ <b>{editing_key}</b> ကို Database ထဲတွင် အောင်မြင်စွာ Update လုပ်ပြီးပါပြီ။\n\n"
+        f"<b>စာသားအသစ်:</b>\n{new_text}",
+        parse_mode="HTML",
+    )
+    return True
     
 # ==================== ENVIRONMENT VARIABLES ====================
 BOT_TOKEN = os.getenv("BOT_TOKEN", "8909534863:AAEck21ljGacrRR_e4mUZQmGKqeH4tVAqwU")
