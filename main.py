@@ -773,3 +773,114 @@ async def fallback_menu_prompt(message: Message) -> None:
   await message.answer(
       render_template("menu_prompt"), reply_markup=main_menu_keyboard()
     )
+    
+# ==============================================================================
+# 4. LOVABLE WEBHOOK & RAILWAY ENTRYPOINT
+# ==============================================================================
+async def handle_health(request: web.Request) -> web.Response:
+  return web.json_response({"ok": True, "service": "ayk-recap-bot"})
+
+
+async def handle_lovable_webhook(request: web.Request) -> web.Response:
+  if WEBHOOK_SECRET:
+    provided = request.headers.get("X-Webhook-Secret", "").strip()
+    auth_header = request.headers.get("Authorization", "").strip()
+    bearer = (
+        auth_header.replace("Bearer ", "", 1).strip()
+        if auth_header.startswith("Bearer ")
+        else ""
+    )
+    if provided != WEBHOOK_SECRET and bearer != WEBHOOK_SECRET:
+      return web.json_response(
+          {"ok": False, "error": "Unauthorized"}, status=401
+      )
+
+  try:
+    payload = await request.json()
+  except Exception:
+    return web.json_response(
+        {"ok": False, "error": "Invalid JSON"}, status=400
+    )
+
+  if not isinstance(payload, dict):
+    return web.json_response(
+        {"ok": False, "error": "Invalid payload"}, status=400
+    )
+
+  raw_uid = payload.get("user_id") or payload.get("telegram_id")
+  try:
+    uid = int(str(raw_uid).strip())
+  except Exception:
+    return web.json_response(
+        {"ok": False, "error": "Missing or invalid user_id"}, status=400
+    )
+
+  u = ensure_user(uid)
+  active = bool(payload.get("active", payload.get("status") == "active"))
+  plan_name = str(
+      payload.get("plan_name") or payload.get("plan") or "Active Plan"
+  )
+  expires_at = payload.get("expires_at") or payload.get("expiry")
+
+  u["subscription"] = {
+      "active": active,
+      "plan_name": plan_name,
+      "expires_at": expires_at,
+      "source": "lovable_webhook",
+  }
+  u["updated_at"] = datetime.now(timezone.utc).isoformat()
+  save_data(DB)
+
+  bot: Optional[Bot] = request.app.get("bot")
+  if bot and payload.get("notify_user", True):
+    try:
+      status_msg = "Active ✅" if active else "Inactive ❌"
+      await bot.send_message(
+          chat_id=uid,
+          text=(
+              "🔔 **Subscription Status Updated**\n"
+              f"• Status: {status_msg}\n"
+              f"• Plan: {plan_name}\n"
+              f"• Expires At: `{expires_at or '-'}`"
+          ),
+      )
+    except Exception:
+      pass
+
+  return web.json_response(
+      {"ok": True, "user_id": uid, "subscription": u["subscription"]}
+  )
+
+
+async def start_http_server(bot: Bot) -> web.AppRunner:
+  app = web.Application()
+  app["bot"] = bot
+  app.router.add_get("/", handle_health)
+  app.router.add_get("/health", handle_health)
+  app.router.add_post("/webhook/lovable", handle_lovable_webhook)
+
+  runner = web.AppRunner(app)
+  await runner.setup()
+  site = web.TCPSite(runner, host="0.0.0.0", port=PORT)
+  await site.start()
+  return runner
+
+
+async def main() -> None:
+  bot = Bot(
+      token=BOT_TOKEN,
+      default=DefaultBotProperties(parse_mode=ParseMode.MARKDOWN),
+  )
+  dp = Dispatcher(storage=MemoryStorage())
+  dp.include_router(router)
+
+  runner = await start_http_server(bot)
+  try:
+    await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+  finally:
+    await runner.cleanup()
+    await bot.session.close()
+
+
+if __name__ == "__main__":
+  asyncio.run(main())
