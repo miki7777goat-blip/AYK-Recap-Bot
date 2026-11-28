@@ -1,495 +1,537 @@
-import json
+"""
+AYK Recap Bot — aiogram v3 + Supabase (aiohttp REST) backend.
+
+Environment variables (loaded from .env or the process env):
+    BOT_TOKEN      — Telegram bot token (required)
+    OWNER_ID       — integer Telegram user id of the bot owner (recommended)
+    SUPABASE_URL   — Supabase project URL
+    SUPABASE_KEY   — Supabase API key (secret / service role)
+
+Falls back to the project defaults only if env vars are missing, so that
+the bot boots out-of-the-box for a quick demo. For production, ALWAYS
+provide them via environment variables.
+"""
+
+from __future__ import annotations
+
+import asyncio
 import logging
 import os
+import sys
 from datetime import datetime, timezone
-from typing import Any, Dict
+from typing import Any
 
 import aiohttp
-from aiohttp import web
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
+    BotCommand,
     CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     KeyboardButton,
     Message,
     ReplyKeyboardMarkup,
-    ReplyKeyboardRemove,
 )
+from dotenv import load_dotenv
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("AYK-Recap-Bot")
+# --------------------------------------------------------------------------- #
+#  Configuration
+# --------------------------------------------------------------------------- #
+load_dotenv()
 
-# ==========================================
-# PART 1: CONFIG, SUPABASE & WEBHOOK HELPER
-# ==========================================
-
-BOT_TOKEN: str = os.getenv(
-    "BOT_TOKEN", "8909534863:AAEck21ljGacrRR_e4mUZQmGKqeH4tVAqwU"
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)-7s | %(name)s | %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
 )
-OWNER_ID: int = int(os.getenv("OWNER_ID", "8415289516"))
-ADMIN_GROUP_ID: int = int(os.getenv("ADMIN_GROUP_ID", "-100448651266"))
-WEBHOOK_URL: str = os.getenv(
-    "WEBHOOK_URL",
-    "https://aykrecaptool.lovable.app/api/public/subscription/update",
-)
-WEBHOOK_SECRET: str = os.getenv("WEBHOOK_SECRET", "")
-PORT: int = int(os.getenv("PORT", "8080"))
+logger = logging.getLogger("ayk-bot")
 
-# Supabase Bot Data Persistence (Optional Env Vars)
-SUPABASE_URL: str = os.getenv("SUPABASE_URL", "").rstrip("/")
-SUPABASE_KEY: str = os.getenv("SUPABASE_SERVICE_ROLE_KEY") or os.getenv("SUPABASE_KEY", "")
-SUPABASE_TABLE: str = os.getenv("SUPABASE_BOT_TABLE", "bot_data")
-SUPABASE_ROW_ID: str = os.getenv("SUPABASE_BOT_ROW_ID", "ayk_recap_bot")
-LOCAL_FALLBACK_FILE: str = "bot_data.json"
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+
+_owner_raw = os.getenv("OWNER_ID", "").strip()
+try:
+    OWNER_ID: int = int(_owner_raw) if _owner_raw else 0
+except ValueError:
+    OWNER_ID = 0
+    logger.warning("OWNER_ID=%r is not a valid integer; owner features disabled", _owner_raw)
+
+SUPABASE_URL = os.getenv("SUPABASE_URL", "https://tcyqlwzgvocjwtyqbxsp.supabase.co").rstrip("/")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
+
+if not BOT_TOKEN:
+    logger.critical("BOT_TOKEN is not set. Aborting.")
+    sys.exit(1)
+if not OWNER_ID:
+    logger.warning("OWNER_ID is not set — /admin and admin buttons will be disabled.")
+
+BOT_USERNAME: str = ""  # filled in at startup
+
+# --------------------------------------------------------------------------- #
+#  Supabase client (aiohttp REST)
+# --------------------------------------------------------------------------- #
+class Supabase:
+    """Minimal async REST client for Supabase PostgREST."""
+
+    def __init__(self, url: str, key: str) -> None:
+        self.base = f"{url}/rest/v1"
+        self.key = key
+        self._session: aiohttp.ClientSession | None = None
+
+    # -- lifecycle --------------------------------------------------------- #
+    async def _get_session(self) -> aiohttp.ClientSession:
+        if self._session is None or self._session.closed:
+            self._session = aiohttp.ClientSession(
+                headers={
+                    "apikey": self.key,
+                    "Authorization": f"Bearer {self.key}",
+                    "Content-Type": "application/json",
+                },
+                timeout=aiohttp.ClientTimeout(total=15),
+            )
+        return self._session
+
+    async def close(self) -> None:
+        if self._session and not self._session.closed:
+            await self._session.close()
+
+    # -- helpers ----------------------------------------------------------- #
+    @staticmethod
+    def _count_from_headers(headers: Any) -> int:
+        content_range = headers.get("Content-Range", "") if headers else ""
+        if "/" in content_range:
+            try:
+                return int(content_range.rsplit("/", 1)[-1])
+            except ValueError:
+                return 0
+        return 0
+
+    # -- queries ----------------------------------------------------------- #
+    async def select(self, table: str, params: dict[str, str] | None = None) -> list[dict]:
+        try:
+            session = await self._get_session()
+            async with session.get(f"{self.base}/{table}", params=params or {}) as resp:
+                if resp.status >= 400:
+                    logger.error("Supabase select [%s] %s → %s", table, resp.status, await resp.text())
+                    return []
+                return await resp.json()
+        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+            logger.error("Supabase select [%s] network error: %s", table, exc)
+            return []
+
+    async def upsert(
+        self,
+        table: str,
+        data: dict | list[dict],
+        on_conflict: str | None = None,
+    ) -> list[dict]:
+        try:
+            session = await self._get_session()
+            params = {"on_conflict": on_conflict} if on_conflict else {}
+            headers = {"Prefer": "resolution=merge-duplicates,return=representation"}
+            async with session.post(
+                f"{self.base}/{table}", json=data, params=params, headers=headers
+            ) as resp:
+                if resp.status >= 400:
+                    logger.error("Supabase upsert [%s] %s → %s", table, resp.status, await resp.text())
+                    return []
+                return await resp.json()
+        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+            logger.error("Supabase upsert [%s] network error: %s", table, exc)
+            return []
+
+    async def count(self, table: str, params: dict[str, str] | None = None) -> int:
+        try:
+            session = await self._get_session()
+            headers = {"Prefer": "count=exact", "Range": "0-0"}
+            q = {"select": "user_id"}
+            if params:
+                q.update(params)
+            async with session.get(f"{self.base}/{table}", params=q, headers=headers) as resp:
+                if resp.status >= 400:
+                    return 0
+                return self._count_from_headers(resp.headers)
+        except (aiohttp.ClientError, asyncio.TimeoutError):
+            return 0
+
+    # -- domain helpers ---------------------------------------------------- #
+    async def get_user(self, user_id: int) -> dict | None:
+        rows = await self.select(
+            "users", {"user_id": f"eq.{user_id}", "select": "*", "limit": "1"}
+        )
+        return rows[0] if rows else None
+
+    async def upsert_user(self, user_id: int, **fields: Any) -> dict | None:
+        payload = {"user_id": user_id, **fields}
+        rows = await self.upsert("users", payload, on_conflict="user_id")
+        return rows[0] if rows else None
+
+    async def count_referrals(self, referrer_id: int) -> int:
+        return await self.count("users", {"referrer_id": f"eq.{referrer_id}"})
+
+    async def count_users(self) -> int:
+        return await self.count("users")
+
+    async def count_active_subs(self) -> int:
+        now = datetime.now(timezone.utc).isoformat()
+        return await self.count("users", {"subscription_until": f"gt.{now}"})
+
+    async def all_user_ids(self) -> list[int]:
+        rows = await self.select("users", {"select": "user_id"})
+        return [int(r["user_id"]) for r in rows if "user_id" in r]
 
 
-def default_bot_data() -> Dict[str, Any]:
-    return {
-        "settings": {
-            "pro_price": "10,000 Ks / 1 Month",
-            "vip_price": "25,000 Ks / 1 Month",
-        },
-        "users": {},
-        "referrals": {},
-        "banned_users": [],
-    }
+db = Supabase(SUPABASE_URL, SUPABASE_KEY)
+
+# --------------------------------------------------------------------------- #
+#  Auth helpers
+# --------------------------------------------------------------------------- #
+def is_owner(user_id: int | None) -> bool:
+    return bool(OWNER_ID) and user_id == OWNER_ID
 
 
-class SubscriptionStates(StatesGroup):
-    waiting_for_email = State()
-    waiting_for_plan = State()
-    waiting_for_proof = State()
+# --------------------------------------------------------------------------- #
+#  Keyboards
+# --------------------------------------------------------------------------- #
+def main_menu_kb(is_admin: bool = False) -> ReplyKeyboardMarkup:
+    rows = [
+        [KeyboardButton(text="👤 Profile"), KeyboardButton(text="📋 Plans")],
+        [KeyboardButton(text="🎁 Referral"), KeyboardButton(text="⚙️ Settings")],
+    ]
+    if is_admin:
+        rows.append([KeyboardButton(text="🔧 Admin Panel")])
+    return ReplyKeyboardMarkup(
+        keyboard=rows,
+        resize_keyboard=True,
+        is_persistent=True,
+        input_field_placeholder="Choose an option…",
+    )
 
 
+def plans_ikb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="1 Month — $5", callback_data="sub:1m")],
+            [InlineKeyboardButton(text="3 Months — $12", callback_data="sub:3m")],
+            [InlineKeyboardButton(text="12 Months — $40", callback_data="sub:12m")],
+        ]
+    )
+
+
+def admin_ikb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="📊 Stats", callback_data="admin:stats")],
+            [InlineKeyboardButton(text="👥 Recent Users", callback_data="admin:users")],
+            [InlineKeyboardButton(text="📢 Broadcast", callback_data="admin:broadcast")],
+        ]
+    )
+
+
+# --------------------------------------------------------------------------- #
+#  FSM states
+# --------------------------------------------------------------------------- #
+class AdminStates(StatesGroup):
+    waiting_broadcast = State()
+
+
+# --------------------------------------------------------------------------- #
+#  Router & utility
+# --------------------------------------------------------------------------- #
 router = Router()
 
 
-def get_utc_now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-
-def _supabase_enabled() -> bool:
-    return bool(SUPABASE_URL and SUPABASE_KEY)
-
-
-def _supabase_headers() -> Dict[str, str]:
-    return {
-        "apikey": SUPABASE_KEY,
-        "Authorization": f"Bearer {SUPABASE_KEY}",
-        "Content-Type": "application/json",
-        "Prefer": "resolution=merge-duplicates,return=representation",
-    }
-
-
-def _load_local_fallback() -> Dict[str, Any]:
-    if os.path.exists(LOCAL_FALLBACK_FILE):
-        try:
-            with open(LOCAL_FALLBACK_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                if isinstance(data, dict):
-                    base = default_bot_data()
-                    base.update(data)
-                    return base
-        except Exception as exc:
-            logger.warning("Local fallback load failed: %s", exc)
-    return default_bot_data()
-
-
-def _save_local_fallback(data: Dict[str, Any]) -> None:
+def fmt_dt(raw: str | None) -> str:
+    if not raw:
+        return "—"
     try:
-        with open(LOCAL_FALLBACK_FILE, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-    except Exception as exc:
-        logger.warning("Local fallback save failed: %s", exc)
+        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        return dt.strftime("%Y-%m-%d %H:%M UTC")
+    except Exception:
+        return raw
 
 
-async def load_bot_data() -> Dict[str, Any]:
-    data = _load_local_fallback()
-    if not _supabase_enabled():
-        return data
-
-    url = f"{SUPABASE_URL}/rest/v1/{SUPABASE_TABLE}?id=eq.{SUPABASE_ROW_ID}&select=payload"
-    timeout = aiohttp.ClientTimeout(total=15)
-    try:
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.get(url, headers=_supabase_headers()) as resp:
-                if 200 <= resp.status < 300:
-                    rows = await resp.json()
-                    if isinstance(rows, list) and rows:
-                        payload = rows[0].get("payload")
-                        if isinstance(payload, dict):
-                            merged = default_bot_data()
-                            merged.update(payload)
-                            _save_local_fallback(merged)
-                            return merged
-                else:
-                    logger.warning("Supabase GET status %s: %s", resp.status, await resp.text())
-    except Exception as exc:
-        logger.warning("Supabase GET error: %s", exc)
-
-    return data
+async def reply_with_menu(message: Message, text: str) -> None:
+    await message.answer(text, reply_markup=main_menu_kb(is_owner(message.from_user.id)))
 
 
-async def save_bot_data(data: Dict[str, Any]) -> None:
-    _save_local_fallback(data)
-    if not _supabase_enabled():
-        return
-
-    url = f"{SUPABASE_URL}/rest/v1/{SUPABASE_TABLE}?on_conflict=id"
-    body = [{"id": SUPABASE_ROW_ID, "payload": data, "updated_at": get_utc_now_iso()}]
-    timeout = aiohttp.ClientTimeout(total=15)
-    try:
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.post(url, json=body, headers=_supabase_headers()) as resp:
-                if not (200 <= resp.status < 300):
-                    logger.warning("Supabase UPSERT status %s: %s", resp.status, await resp.text())
-    except Exception as exc:
-        logger.warning("Supabase UPSERT error: %s", exc)
-
-
-async def post_subscription_update(payload: Dict[str, Any]) -> Dict[str, Any]:
-    headers: Dict[str, str] = {"Content-Type": "application/json"}
-    if WEBHOOK_SECRET:
-        headers["X-Webhook-Secret"] = WEBHOOK_SECRET
-
-    timeout = aiohttp.ClientTimeout(total=20)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        async with session.post(WEBHOOK_URL, json=payload, headers=headers) as resp:
-            text_body = await resp.text()
-            try:
-                parsed = await resp.json()
-            except Exception:
-                parsed = text_body
-            return {
-                "ok": 200 <= resp.status < 300,
-                "status": resp.status,
-                "data": parsed,
-}
-# ==========================================
-# PART 2: KEYBOARDS & BOT HANDLERS
-# ==========================================
-
-
-def build_main_menu() -> ReplyKeyboardMarkup:
-    return ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text="📦 Plan ဝယ်ယူရန်"), KeyboardButton(text="👤 Profile")],
-            [KeyboardButton(text="ℹ️ အကူအညီ")],
-        ],
-        resize_keyboard=True,
-    )
-
-
-def build_plan_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(text="Pro Plan (30 Days)", callback_data="plan:PRO:30"),
-                InlineKeyboardButton(text="VIP Plan (30 Days)", callback_data="plan:VIP:30"),
-            ],
-            [InlineKeyboardButton(text="❌ ပယ်ဖျက်မည်", callback_data="plan:cancel")],
-        ]
-    )
-
-
-def build_admin_review_keyboard(user_id: int, email: str, plan: str, days: int) -> InlineKeyboardMarkup:
-    safe_token = f"{user_id}|{email}|{plan}|{days}"
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(text="✅ Approve", callback_data=f"adm_ok:{safe_token}"),
-                InlineKeyboardButton(text="❌ Reject", callback_data=f"adm_no:{safe_token}"),
-            ]
-        ]
-    )
-
-
+# --------------------------------------------------------------------------- #
+#  Basic commands
+# --------------------------------------------------------------------------- #
 @router.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext) -> None:
     await state.clear()
-    if message.from_user:
-        bot_data = await load_bot_data()
-        uid_str = str(message.from_user.id)
-        users = bot_data.setdefault("users", {})
-        users[uid_str] = {
-            "id": message.from_user.id,
-            "name": message.from_user.full_name,
-            "username": message.from_user.username or "",
-            "last_seen": get_utc_now_iso(),
-        }
-        await save_bot_data(bot_data)
+    user = message.from_user
+    if user is None:
+        return
 
-    await message.answer(
-        "မင်္ဂလာပါ <b>AYK Recap Bot</b> မှ ကြိုဆိုပါတယ်ခင်ဗျာ။\n"
-        "အောက်ပါ Menu မှတစ်ဆင့် Plan ဝယ်ယူခြင်းနှင့် အခြားဝန်ဆောင်မှုများကို အသုံးပြုနိုင်ပါတယ်။",
-        reply_markup=build_main_menu(),
+    # Referral parsing: /start ref_12345
+    referrer_id: int | None = None
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) == 2 and parts[1].startswith("ref_"):
+        try:
+            candidate = int(parts[1][4:])
+            if candidate != user.id and await db.get_user(candidate):
+                referrer_id = candidate
+        except ValueError:
+            pass
+
+    existing = await db.get_user(user.id)
+    if existing is None:
+        await db.upsert_user(
+            user.id,
+            username=user.username,
+            first_name=user.first_name,
+            joined_at=datetime.now(timezone.utc).isoformat(),
+            referrer_id=referrer_id,
+            plan="free",
+        )
+    else:
+        await db.upsert_user(
+            user.id, username=user.username, first_name=user.first_name
+        )
+
+    await reply_with_menu(
+        message,
+        f"👋 Welcome, <b>{user.first_name or 'friend'}</b>!\n\n"
+        f"I'm <b>AYK Recap Bot</b>. Use the menu below to get started.",
     )
+
+
+@router.message(Command("menu"))
+async def cmd_menu(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    await reply_with_menu(message, "🏠 <b>Main menu</b>")
 
 
 @router.message(Command("cancel"))
-@router.message(F.text == "❌ ပယ်ဖျက်မည်")
 async def cmd_cancel(message: Message, state: FSMContext) -> None:
     await state.clear()
-    await message.answer("လုပ်ဆောင်ချက်ကို ပယ်ဖျက်လိုက်ပါပြီ။", reply_markup=build_main_menu())
+    await reply_with_menu(message, "✅ Action cancelled.")
 
 
+# --------------------------------------------------------------------------- #
+#  Menu handlers
+# --------------------------------------------------------------------------- #
 @router.message(F.text == "👤 Profile")
-async def handle_profile(message: Message) -> None:
+async def show_profile(message: Message, state: FSMContext) -> None:
+    await state.clear()
     user = message.from_user
-    username_display = f"@{user.username}" if user and user.username else "မရှိပါ"
+    if user is None:
+        return
+    data = await db.get_user(user.id)
+    if not data:
+        await reply_with_menu(message, "⚠️ Profile not found. Please send /start.")
+        return
+    ref_count = await db.count_referrals(user.id)
+    text = (
+        "👤 <b>Your Profile</b>\n\n"
+        f"🆔 ID: <code>{user.id}</code>\n"
+        f"👤 Name: {user.first_name or '—'}\n"
+        f"🔗 Username: @{user.username or '—'}\n"
+        f"💼 Plan: <b>{data.get('plan') or 'free'}</b>\n"
+        f"📅 Valid until: {fmt_dt(data.get('subscription_until'))}\n"
+        f"🎁 Referrals: <b>{ref_count}</b>"
+    )
+    await reply_with_menu(message, text)
+
+
+@router.message(F.text == "📋 Plans")
+async def show_plans(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    text = (
+        "📋 <b>Available Plans</b>\n\n"
+        "• <b>1 Month</b> — $5\n"
+        "• <b>3 Months</b> — $12 (save 20%)\n"
+        "• <b>12 Months</b> — $40 (best value)\n\n"
+        "Choose a plan:"
+    )
+    await message.answer(text, reply_markup=plans_ikb())
+    # Keep the persistent keyboard alive
     await message.answer(
-        f"👤 <b>User Profile</b>\n"
-        f"• Name: {user.full_name if user else 'Unknown'}\n"
-        f"• Telegram ID: <code>{user.id if user else 0}</code>\n"
-        f"• Username: {username_display}",
-        reply_markup=build_main_menu(),
+        "Use the menu anytime 👇",
+        reply_markup=main_menu_kb(is_owner(message.from_user.id)),
     )
 
 
-@router.message(F.text == "ℹ️ အကူအညီ")
-async def handle_help(message: Message) -> None:
-    await message.answer(
-        "📌 <b>အသုံးပြုပုံ လမ်းညွှန်</b>\n"
-        "1. <b>📦 Plan ဝယ်ယူရန်</b> ကို နှိပ်ပါ။\n"
-        "2. App တွင် မှတ်ပုံတင်ထားသော <b>Email</b> ကို ထည့်ပါ။\n"
-        "3. လိုချင်သော <b>Plan</b> ကို ရွေးချယ်ပြီး <b>ငွေလွှဲပြေစာ (Photo)</b> ပို့ပါ။\n"
-        "4. Admin အတည်ပြုပြီးသည်နှင့် Plan အလိုအလျောက် Update ဖြစ်ပါမည်။",
-        reply_markup=build_main_menu(),
+@router.message(F.text == "🎁 Referral")
+async def show_referral(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    user = message.from_user
+    if user is None:
+        return
+    count = await db.count_referrals(user.id)
+    link = f"https://t.me/{BOT_USERNAME}?start=ref_{user.id}" if BOT_USERNAME else "—"
+    text = (
+        "🎁 <b>Referral Program</b>\n\n"
+        f"Your invite link:\n<code>{link}</code>\n\n"
+        f"👥 Invited friends: <b>{count}</b>"
     )
+    await reply_with_menu(message, text)
 
 
-@router.message(F.text == "📦 Plan ဝယ်ယူရန်")
-async def handle_buy_plan_start(message: Message, state: FSMContext) -> None:
-    await state.set_state(SubscriptionStates.waiting_for_email)
-    await message.answer(
-        "ကျေးဇူးပြု၍ သင့် App Account တွင် အသုံးပြုထားသော <b>Email</b> လိပ်စာကို ရိုက်ထည့်ပေးပါ။\n"
-        "(ပယ်ဖျက်လိုပါက /cancel သို့မဟုတ် ❌ ပယ်ဖျက်မည် ကို နှိပ်ပါ)",
-        reply_markup=ReplyKeyboardRemove(),
-    )
+@router.message(F.text == "⚙️ Settings")
+async def show_settings(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    await reply_with_menu(message, "⚙️ <b>Settings</b>\n\nComing soon.")
 
 
-@router.message(SubscriptionStates.waiting_for_email, F.text)
-async def handle_email_input(message: Message, state: FSMContext) -> None:
-    email = (message.text or "").strip().lower()
-    if "@" not in email or "." not in email.split("@")[-1]:
-        await message.answer("⚠️ Email ဖော်မက် မှားယွင်းနေပါသည်။ မှန်ကန်သော Email ကို ထပ်မံရိုက်ထည့်ပေးပါ။")
+# --------------------------------------------------------------------------- #
+#  Admin panel
+# --------------------------------------------------------------------------- #
+@router.message(F.text == "🔧 Admin Panel")
+async def show_admin(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    if not is_owner(message.from_user.id):
+        await message.answer("⛔ Access denied.", reply_markup=main_menu_kb(False))
         return
-
-    await state.update_data(email=email)
-    await state.set_state(SubscriptionStates.waiting_for_plan)
-    await message.answer(
-        f"✅ Email: <code>{email}</code>\n\nကျေးဇူးပြု၍ ဝယ်ယူလိုသော Plan ကို ရွေးချယ်ပါ။",
-        reply_markup=build_plan_keyboard(),
-    )
+    await message.answer("🔧 <b>Admin Panel</b>", reply_markup=admin_ikb())
+    await message.answer("Menu:", reply_markup=main_menu_kb(True))
 
 
-@router.callback_query(SubscriptionStates.waiting_for_plan, F.data.startswith("plan:"))
-async def handle_plan_selection(callback: CallbackQuery, state: FSMContext) -> None:
-    if not callback.data or not callback.message:
-        return
-
-    parts = callback.data.split(":")
-    if len(parts) == 2 and parts[1] == "cancel":
-        await state.clear()
-        await callback.message.edit_text("❌ Plan ဝယ်ယူမှုကို ပယ်ဖျက်လိုက်ပါပြီ။")
-        await callback.message.answer("ပင်မ Menu သို့ ပြန်ရောက်ပါပြီ။", reply_markup=build_main_menu())
-        await callback.answer()
-        return
-
-    if len(parts) != 3:
-        await callback.answer("Invalid plan data.", show_alert=True)
-        return
-
-    _, plan_code, days_str = parts
-    try:
-        days = int(days_str)
-    except ValueError:
-        await callback.answer("Invalid duration.", show_alert=True)
-        return
-
-    await state.update_data(plan=plan_code.upper(), duration_days=days)
-    await state.set_state(SubscriptionStates.waiting_for_proof)
-    await callback.message.edit_text(
-        f"📦 ရွေးချယ်ထားသော Plan: <b>{plan_code.upper()}</b> ({days} ရက်)\n\n"
-        "ငွေလွှဲပြီးကြောင်း <b>Screenshot / ပြေစာ ဓာတ်ပုံ (Photo)</b> တစ်ပုံ ပို့ပေးပါ။"
-    )
+@router.callback_query(F.data.startswith("admin:"))
+async def handle_admin_cb(callback: CallbackQuery, state: FSMContext) -> None:
     await callback.answer()
+    if not is_owner(callback.from_user.id):
+        return
+
+    action = callback.data.split(":", 1)[1]
+    message = callback.message
+
+    if action == "stats":
+        total = await db.count_users()
+        active = await db.count_active_subs()
+        text = (
+            "📊 <b>Bot Statistics</b>\n\n"
+            f"👥 Total users: <b>{total}</b>\n"
+            f"💎 Active subscribers: <b>{active}</b>"
+        )
+        if message:
+            await message.edit_text(text, reply_markup=admin_ikb())
+
+    elif action == "users":
+        rows = await db.select(
+            "users",
+            {"select": "user_id,first_name,username,plan,joined_at",
+             "order": "joined_at.desc.nullslast",
+             "limit": "20"},
+        )
+        if not rows:
+            text = "👥 No users yet."
+        else:
+            lines = ["👥 <b>Recent 20 users</b>\n"]
+            for r in rows:
+                lines.append(
+                    f"• <code>{r['user_id']}</code> — "
+                    f"{r.get('first_name') or '—'} "
+                    f"(@{r.get('username') or '—'}) · {r.get('plan') or 'free'}"
+                )
+            text = "\n".join(lines)
+        if message:
+            await message.edit_text(text, reply_markup=admin_ikb())
+
+    elif action == "broadcast":
+        await state.set_state(AdminStates.waiting_broadcast)
+        if message:
+            await message.answer(
+                "📢 <b>Broadcast mode</b>\n\nSend the message you want to deliver "
+                "to <i>every</i> user. Any content type is supported.\n\n"
+                "Type /cancel to abort."
+            )
 
 
-@router.message(SubscriptionStates.waiting_for_proof, F.photo)
-async def handle_payment_proof(message: Message, state: FSMContext, bot: Bot) -> None:
-    user_data = await state.get_data()
-    email = user_data.get("email")
-    plan = user_data.get("plan")
-    duration_days = user_data.get("duration_days", 30)
-
-    if not email or not plan or not message.from_user or not message.photo:
-        await message.answer("⚠️ အချက်အလက် မပြည့်စုံပါ။ /start ဖြင့် ပြန်လည်စတင်ပါ။", reply_markup=build_main_menu())
+@router.message(AdminStates.waiting_broadcast)
+async def perform_broadcast(message: Message, state: FSMContext, bot: Bot) -> None:
+    if not is_owner(message.from_user.id):
         await state.clear()
         return
 
-    photo_file_id = message.photo[-1].file_id
-    buyer = message.from_user
-    buyer_mention = f"@{buyer.username}" if buyer.username else buyer.full_name
+    if (message.text or "").strip() == "/cancel":
+        await state.clear()
+        await reply_with_menu(message, "❌ Broadcast cancelled.")
+        return
 
-    caption = (
-        "🧾 <b>New Subscription Payment Request</b>\n"
-        f"• Buyer: {buyer_mention} (<code>{buyer.id}</code>)\n"
-        f"• Email: <code>{email}</code>\n"
-        f"• Plan: <b>{plan}</b> ({duration_days} days)\n"
-        f"• Time: <code>{get_utc_now_iso()}</code>"
+    await state.clear()
+    user_ids = await db.all_user_ids()
+    sent = failed = 0
+    for uid in user_ids:
+        try:
+            await bot.copy_message(
+                chat_id=uid,
+                from_chat_id=message.chat.id,
+                message_id=message.message_id,
+            )
+            sent += 1
+        except (TelegramBadRequest, Exception) as exc:  # noqa: BLE001
+            failed += 1
+            logger.debug("Broadcast to %s failed: %s", uid, exc)
+        await asyncio.sleep(0.05)  # ~20 msg/s, safe under TG limits
+
+    await reply_with_menu(
+        message, f"✅ Broadcast finished.\n\n✔️ Sent: <b>{sent}</b>\n❌ Failed: <b>{failed}</b>"
     )
 
+
+# --------------------------------------------------------------------------- #
+#  Subscription callback
+# --------------------------------------------------------------------------- #
+@router.callback_query(F.data.startswith("sub:"))
+async def handle_sub(callback: CallbackQuery) -> None:
+    await callback.answer()
+    plan = callback.data.split(":", 1)[1]
+    await callback.message.answer(
+        f"📦 You selected the <b>{plan}</b> plan.\n\n"
+        "💳 Payment integration isn't wired up yet. "
+        "Please contact the owner to complete your subscription."
+    )
+
+
+# --------------------------------------------------------------------------- #
+#  Fallback (keeps keyboard persistent)
+# --------------------------------------------------------------------------- #
+@router.message()
+async def fallback(message: Message, state: FSMContext) -> None:
+    current = await state.get_state()
+    if current is not None:
+        return
+    await reply_with_menu(
+        message, "🤔 I didn't understand that. Pick an option from the menu 👇"
+    )
+
+
+# --------------------------------------------------------------------------- #
+#  Bootstrap
+# --------------------------------------------------------------------------- #
+async def on_startup(bot: Bot) -> None:
+    global BOT_USERNAME
+    me = await bot.get_me()
+    BOT_USERNAME = me.username or ""
     try:
-        await bot.send_photo(
-            chat_id=ADMIN_GROUP_ID,
-            photo=photo_file_id,
-            caption=caption,
-            reply_markup=build_admin_review_keyboard(buyer.id, email, plan, int(duration_days)),
+        await bot.set_my_commands(
+            [
+                BotCommand(command="start", description="Start the bot"),
+                BotCommand(command="menu", description="Open main menu"),
+            ]
         )
-        await state.clear()
-        await message.answer(
-            "✅ သင့်ငွေလွှဲပြေစာကို Admin ထံ ပို့ပြီးပါပြီ။ အတည်ပြုပြီးသည်နှင့် အကြောင်းကြားပေးပါမည်။",
-            reply_markup=build_main_menu(),
-        )
-    except Exception as exc:
-        await message.answer(
-            f"⚠️ Admin Group သို့ ပို့ရာတွင် အခက်အခဲ ရှိနေပါသည်: <code>{exc}</code>",
-            reply_markup=build_main_menu(),
-        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("set_my_commands failed: %s", exc)
 
-
-@router.message(SubscriptionStates.waiting_for_proof)
-async def handle_non_photo_proof(message: Message) -> None:
-    await message.answer("⚠️ ကျေးဇူးပြု၍ ငွေလွှဲပြေစာကို <b>ဓာတ်ပုံ (Photo)</b> အနေဖြင့်သာ ပို့ပေးပါ။")
-
-
-@router.callback_query(F.data.startswith(("adm_ok:", "adm_no:")))
-async def handle_admin_decision(callback: CallbackQuery, bot: Bot) -> None:
-    if not callback.data or not callback.message or not callback.from_user:
-        return
-
-    actor_id = callback.from_user.id
-    if actor_id != OWNER_ID and callback.message.chat.id != ADMIN_GROUP_ID:
-        await callback.answer("⛔ ခွင့်ပြုချက် မရှိပါ။", show_alert=True)
-        return
-
-    action, raw_payload = callback.data.split(":", 1)
-    parts = raw_payload.split("|")
-    if len(parts) != 4:
-        await callback.answer("Invalid callback payload.", show_alert=True)
-        return
-
-    buyer_id_str, email, plan, days_str = parts
+    # Ensure no stale webhook conflicts with long polling
     try:
-        buyer_id = int(buyer_id_str)
-        duration_days = int(days_str)
-    except ValueError:
-        await callback.answer("Invalid numeric fields.", show_alert=True)
-        return
+        await bot.delete_webhook(drop_pending_updates=True)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("delete_webhook failed: %s", exc)
 
-    old_caption = callback.message.caption or ""
-
-    if action == "adm_no":
-        try:
-            await callback.message.edit_caption(
-                caption=f"{old_caption}\n\n❌ <b>Rejected</b> by <code>{actor_id}</code>"
-            )
-        except Exception:
-            pass
-        try:
-            await bot.send_message(
-                chat_id=buyer_id,
-                text=f"❌ သင့် <b>{plan}</b> Plan ဝယ်ယူမှုကို ပယ်ချလိုက်ပါသည်။ အသေးစိတ်သိလိုပါက Support ကို ဆက်သွယ်ပါ။",
-            )
-        except Exception:
-            pass
-        await callback.answer("Rejected.")
-        return
-
-    payload: Dict[str, Any] = {
-        "email": email,
-        "plan": plan,
-        "status": "ACTIVE",
-        "startDate": get_utc_now_iso(),
-        "durationDays": duration_days,
-        "telegramUserId": buyer_id,
-    }
-
-    result = await post_subscription_update(payload)
-    if result["ok"]:
-        bot_data = await load_bot_data()
-        subscriptions = bot_data.setdefault("subscriptions", {})
-        subscriptions[str(buyer_id)] = {
-            "email": email,
-            "plan": plan,
-            "status": "ACTIVE",
-            "durationDays": duration_days,
-            "updatedAt": get_utc_now_iso(),
-        }
-        await save_bot_data(bot_data)
-
-        try:
-            await callback.message.edit_caption(
-                caption=f"{old_caption}\n\n✅ <b>Approved & Synced</b> (HTTP {result['status']}) by <code>{actor_id}</code>"
-            )
-        except Exception:
-            pass
-        try:
-            await bot.send_message(
-                chat_id=buyer_id,
-                text=(
-                    f"🎉 ဂုဏ်ယူပါတယ်! သင့် <b>{plan}</b> Plan ({duration_days} ရက်) ကို "
-                    f"<code>{email}</code> အတွက် အောင်မြင်စွာ Activate လုပ်ပြီးပါပြီ။"
-                ),
-            )
-        except Exception:
-            pass
-        await callback.answer("✅ Approved & Webhook updated!")
-    else:
-        err_detail = result["data"]
-        try:
-            await callback.message.edit_caption(
-                caption=(
-                    f"{old_caption}\n\n⚠️ <b>Webhook Failed</b> (HTTP {result['status']}) by <code>{actor_id}</code>\n"
-                    f"<code>{err_detail}</code>"
-                )
-            )
-        except Exception:
-            pass
-        await callback.answer(f"Webhook error ({result['status']})", show_alert=True)
-        # ==========================================
-# PART 3: HEALTH SERVER & MAIN ENTRYPOINT
-# ==========================================
-
-
-async def health_handler(request: web.Request) -> web.Response:
-    return web.json_response({"status": "ok", "service": "AYK-Recap-Bot"})
-
-
-async def start_health_server() -> web.AppRunner:
-    app = web.Application()
-    app.router.add_get("/", health_handler)
-    app.router.add_get("/health", health_handler)
-
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, host="0.0.0.0", port=PORT)
-    await site.start()
-    return runner
+    logger.info("Bot @%s is up (owner_id=%s)", BOT_USERNAME or "?", OWNER_ID or "unset")
 
 
 async def main() -> None:
-    if not BOT_TOKEN or BOT_TOKEN == "YOUR_BOT_TOKEN_HERE":
-        raise RuntimeError("BOT_TOKEN is missing.")
-
     bot = Bot(
         token=BOT_TOKEN,
         default=DefaultBotProperties(parse_mode=ParseMode.HTML),
@@ -497,19 +539,18 @@ async def main() -> None:
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
 
-    await load_bot_data()
-    runner = await start_health_server()
+    dp.startup.register(on_startup)
+
     try:
-        await bot.delete_webhook(drop_pending_updates=False)
-        await dp.start_polling(bot)
+        await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
     finally:
-        await runner.cleanup()
+        await db.close()
         await bot.session.close()
+        logger.info("Shutdown complete.")
 
 
 if __name__ == "__main__":
-    import asyncio
-
-    asyncio.run(main())
-
-             
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        logger.info("Stopped by user.")
