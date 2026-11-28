@@ -485,4 +485,301 @@ def handle_admin_callback(call):
 
     if action == "app":
         plan = sub_type
+        bot.answer_callback_query(call.id, f"Updating {plan} in App...")
+
+        res = call_subscription_webhook(email=email, plan=plan, duration_days=30)
+        if res["success"]:
+            expiry = res["expiry"]
+            pending_requests.pop(req_id, None)
+            bot.edit_message_caption(
+                chat_id=call.message.chat.id,
+                message_id=call.message.message_id,
+                caption=f"{call.message.caption}\n\n✅ <b>APPROVED ({plan}) by {admin_tag}</b>\nExpiry: <code>{expiry}</code>",
+                reply_markup=None
+            )
+            try:
+                bot.send_message(
+                    uid,
+                    f"🎉 <b>ဂုဏ်ယူပါသည်!</b>\n\n{plan_notice}\n\nသင့်အကောင့် (<code>{email}</code>) ကို <b>{plan} Plan</b> အဖြစ် အတည်ပြုဖွင့်လှစ်ပေးလိုက်ပါပြီ။\nသက်တမ်း: <code>{expiry}</code> ထိ အသုံးပြုနိုင်ပါသည်။"
+                )
+            except Exception:
+                pass
+        else:
+            bot.send_message(call.message.chat.id, f"⚠️ Webhook Error: <code>{res.get('error')}</code>")
+
+    elif action == "rej":
+        pending_requests.pop(req_id, None)
+        if sub_type == "insuf":
+            bot.edit_message_caption(
+                chat_id=call.message.chat.id,
+                message_id=call.message.message_id,
+                caption=f"{call.message.caption}\n\n❌ <b>REJECTED (ငွေမလုံလောက်) by {admin_tag}</b>",
+                reply_markup=None
+            )
+            try:
+                bot.send_message(uid, "❌ သင်ပေးပို့သော ငွေလွှဲစလစ်သည် ပမာဏမလုံလောက်ပါ သို့မဟုတ် မှားယွင်းနေပါသည်။ Support သို့ ဆက်သွယ်ပါ။")
+            except Exception:
+                pass
+        elif sub_type == "spam":
+            if uid not in bot_data["banned_users"]:
+                bot_data["banned_users"].append(uid)
+                save_data(bot_data)
+            bot.edit_message_caption(
+                chat_id=call.message.chat.id,
+                message_id=call.message.message_id,
+                caption=f"{call.message.caption}\n\n🚫 <b>USER BANNED (Spam/Fake) by {admin_tag}</b>",
+                reply_markup=None
+            )
+
+# ==================== OWNER PANEL, NOTIFICATION MGMT & USER CONTROL ====================
+@bot.message_handler(func=lambda msg: msg.chat.type == "private" and msg.text == "⚙️ Owner Menu")
+def handle_owner_menu(message):
+    if message.from_user.id != OWNER_ID:
+        return
+    bot.send_message(message.chat.id, build_owner_panel_text(), reply_markup=owner_inline_keyboard())
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith(("owner_", "notif_", "uc_")))
+def handle_owner_panel_callbacks(call):
+    if call.from_user.id != OWNER_ID:
+        bot.answer_callback_query(call.id, "Unauthorized", show_alert=True)
+        return
+
+    data = call.data
+
+    if data == "owner_main_menu":
+        bot.answer_callback_query(call.id)
+        bot.send_message(call.message.chat.id, "🏠 Main Menu", reply_markup=main_menu_keyboard(OWNER_ID))
+
+    elif data == "owner_back_main":
+        bot.edit_message_text(
+            build_owner_panel_text(),
+            chat_id=call.message.chat.id,
+            message_id=call.message.message_id,
+            reply_markup=owner_inline_keyboard()
+        )
+        bot.answer_callback_query(call.id)
+
+    elif data == "owner_view_settings":
+        bot.send_message(call.message.chat.id, build_owner_panel_text())
+        bot.answer_callback_query(call.id)
+
+    elif data == "owner_broadcast":
+        user_states[OWNER_ID] = {"step": "BROADCAST_MSG"}
+        bot.send_message(call.message.chat.id, "📢 User များအားလုံးထံ ပို့လိုသော Broadcast မက်ဆေ့ခ်ျကို ရိုက်ထည့်ပေးပါ (ပယ်ဖျက်ရန် /cancel):")
+        bot.answer_callback_query(call.id)
+
+    elif data.startswith("owner_set_"):
+        action = data.replace("owner_", "")
+        field_map = {
+            "set_kpay": ("KPay (ဖုန်းနံပါတ် နှင့် အမည်)", "kpay"),
+            "set_wave": ("Wave (ဖုန်းနံပါတ် နှင့် အမည်)", "wave"),
+            "set_pro_price": ("Pro Plan စျေးနှုန်း", "pro_price"),
+            "set_vip_price": ("VIP Plan စျေးနှုန်း", "vip_price"),
+            "set_ref_rate": ("Referral Rate", "ref_rate"),
+            "set_ref_targets": ("Pro Target နှင့် VIP Target (ဥပမာ: 12 20)", "ref_targets"),
+            "set_support": ("Support Telegram Username (without @)", "support_username")
+        }
+        if action in field_map:
+            label, key = field_map[action]
+            user_states[OWNER_ID] = {"step": f"EDIT_{key}"}
+            bot.send_message(call.message.chat.id, f"📝 <b>{label}</b> အသစ်ကို ရိုက်ထည့်ပေးပါ:")
+            bot.answer_callback_query(call.id)
+
+    elif data == "notif_menu":
+        bot.edit_message_text(
+            build_notification_summary(),
+            chat_id=call.message.chat.id,
+            message_id=call.message.message_id,
+            reply_markup=notification_mgmt_keyboard()
+        )
+        bot.answer_callback_query(call.id)
+
+    elif data.startswith("notif_edit_"):
+        notif_key = data.replace("notif_edit_", "")
+        labels = {
+            "welcome_msg": "Welcome Message (<code>{first_name}</code>, <code>{full_name}</code>, <code>{username}</code>, <code>{user_id}</code> သုံးနိုင်ပါသည်)",
+            "support_prompt": "Support Prompt Message",
+            "plan_update_msg": "Plan Update Message"
+        }
+        if notif_key in labels:
+            current_val = bot_data["notifications"].get(notif_key, "")
+            user_states[OWNER_ID] = {"step": f"EDIT_NOTIF_{notif_key}"}
+            bot.send_message(
+                call.message.chat.id,
+                f"📝 <b>{labels[notif_key]}</b> အသစ်ကို ရိုက်ထည့်ပေးပါ-\n\n<b>လက်ရှိစာသား:</b>\n{current_val}"
+            )
+            bot.answer_callback_query(call.id)
+
+    elif data == "uc_menu":
+        txt = (
+            "👥 <b>User Control Panel</b>\n"
+            "━━━━━━━━━━━━━━━━━━━\n"
+            f"• Known Users: <b>{len(bot_data.get('known_users', {}))}</b> ယောက်\n"
+            f"• Banned Users: <b>{len(bot_data.get('banned_users', []))}</b> ယောက်\n\n"
+            "လုပ်ဆောင်လိုသော ခလုတ်ကို ရွေးချယ်ပါ-"
+        )
+        bot.edit_message_text(
+            txt,
+            chat_id=call.message.chat.id,
+            message_id=call.message.message_id,
+            reply_markup=user_control_keyboard()
+        )
+        bot.answer_callback_query(call.id)
+
+    elif data == "uc_lookup":
+        user_states[OWNER_ID] = {"step": "UC_LOOKUP"}
+        bot.send_message(call.message.chat.id, "🔍 ကြည့်ရှုလိုသော User ရဲ့ <b>Telegram ID</b> ကို ရိုက်ထည့်ပေးပါ:")
+        bot.answer_callback_query(call.id)
+
+    elif data == "uc_ban":
+        user_states[OWNER_ID] = {"step": "UC_BAN"}
+        bot.send_message(call.message.chat.id, "🚫 Ban ပြုလုပ်လိုသော User ရဲ့ <b>Telegram ID</b> ကို ရိုက်ထည့်ပေးပါ:")
+        bot.answer_callback_query(call.id)
+
+    elif data == "uc_unban":
+        user_states[OWNER_ID] = {"step": "UC_UNBAN"}
+        bot.send_message(call.message.chat.id, "✅ Unban ပြုလုပ်လိုသော User ရဲ့ <b>Telegram ID</b> ကို ရိုက်ထည့်ပေးပါ:")
+        bot.answer_callback_query(call.id)
+
+    elif data == "uc_banned_list":
+        banned = bot_data.get("banned_users", [])
+        if not banned:
+            bot.send_message(call.message.chat.id, "📋 Ban စာရင်းထဲတွင် User မရှိသေးပါ။")
+        else:
+            lines = ["📋 <b>Banned Users List</b>\n━━━━━━━━━━━━━━━━━━━"]
+            for uid in banned:
+                u_info = bot_data.get("known_users", {}).get(str(uid), {})
+                uname = f"@{u_info['username']}" if u_info.get("username") else "none"
+                lines.append(f"• <code>{uid}</code> — {u_info.get('name', 'Unknown')} ({uname})")
+            bot.send_message(call.message.chat.id, "\n".join(lines))
+        bot.answer_callback_query(call.id)
+
+@bot.message_handler(
+    func=lambda msg: msg.chat.type == "private"
+    and msg.from_user.id == OWNER_ID
+    and user_states.get(OWNER_ID, {}).get("step") is not None
+)
+def handle_owner_input(message):
+    step = user_states[OWNER_ID]["step"]
+    text = (message.text or "").strip()
+    st = bot_data["settings"]
+
+    if step == "BROADCAST_MSG":
+        user_states.pop(OWNER_ID, None)
+        sent_ok = 0
+        sent_fail = 0
+        for uid_str in list(bot_data.get("known_users", {}).keys()):
+            if int(uid_str) in bot_data.get("banned_users", []):
+                continue
+            try:
+                bot.send_message(int(uid_str), text)
+                sent_ok += 1
+            except Exception:
+                sent_fail += 1
+        bot.reply_to(message, f"📢 Broadcast ပြီးစီးပါပြီ။\n• ပို့ပြီး: <b>{sent_ok}</b> | မရောက်: <b>{sent_fail}</b>")
+        return
+
+    if step.startswith("EDIT_NOTIF_"):
+        notif_key = step.replace("EDIT_NOTIF_", "")
+        bot_data["notifications"][notif_key] = text
+        save_data(bot_data)
+        user_states.pop(OWNER_ID, None)
+        bot.reply_to(
+            message,
+            f"✅ <b>{notif_key}</b> ကို အောင်မြင်စွာ ပြင်ဆင်သိမ်းဆည်းပြီးပါပြီ။",
+            reply_markup=notification_mgmt_keyboard()
+        )
+        return
+
+    if step.startswith("EDIT_"):
+        key = step.replace("EDIT_", "")
+        if key == "kpay":
+            parts = text.split()
+            st["kpay_phone"] = parts[0] if parts else ""
+            st["kpay_name"] = " ".join(parts[1:]) if len(parts) > 1 else ""
+        elif key == "wave":
+            parts = text.split()
+            st["wave_phone"] = parts[0] if parts else ""
+            st["wave_name"] = " ".join(parts[1:]) if len(parts) > 1 else ""
+        elif key == "pro_price":
+            st["pro_price"] = text
+        elif key == "vip_price":
+            st["vip_price"] = text
+        elif key == "ref_rate":
+            st["ref_rate"] = text
+        elif key == "ref_targets":
+            parts = text.split()
+            if len(parts) >= 2:
+                st["pro_ref_target"] = f"{parts[0]} ယောက်"
+                st["vip_ref_target"] = f"{parts[1]} ယောက်"
+            else:
+                st["pro_ref_target"] = text
+        elif key == "support_username":
+            st["support_username"] = text.replace("@", "")
+
+        save_data(bot_data)
+        user_states.pop(OWNER_ID, None)
+        bot.reply_to(message, f"✅ <b>{key}</b> ဆက်တင်ကို အောင်မြင်စွာ ပြောင်းလဲသိမ်းဆည်းပြီးပါပြီ။")
+        return
+
+    if step in ("UC_LOOKUP", "UC_BAN", "UC_UNBAN"):
+        if not text.isdigit():
+            bot.reply_to(message, "❌ Telegram ID သည် ဂဏန်းသီးသန့် ဖြစ်ရပါမည်။ ပြန်ရိုက်ထည့်ပေးပါ:")
+            return
+
+        target_id = int(text)
+        user_states.pop(OWNER_ID, None)
+        u_info = bot_data.get("known_users", {}).get(str(target_id), {})
+        u_name = u_info.get("name", "Unknown")
+        u_user = f"@{u_info['username']}" if u_info.get("username") else "none"
+        u_seen = u_info.get("last_seen", "N/A")
+        banned_now = target_id in bot_data.get("banned_users", [])
+
+        if step == "UC_LOOKUP":
+            info_txt = (
+                "👤 <b>User Details</b>\n"
+                "━━━━━━━━━━━━━━━━━━━\n"
+                f"• ID: <code>{target_id}</code>\n"
+                f"• Name: {u_name}\n"
+                f"• Username: {u_user}\n"
+                f"• Last Seen: <code>{u_seen}</code>\n"
+                f"• Status: {'🚫 Banned' if banned_now else '✅ Active'}"
+            )
+            bot.reply_to(message, info_txt, reply_markup=user_control_keyboard())
+
+        elif step == "UC_BAN":
+            if target_id == OWNER_ID:
+                bot.reply_to(message, "⚠️ Owner ID ကို Ban လုပ်၍ မရပါ။")
+                return
+            if not banned_now:
+                bot_data["banned_users"].append(target_id)
+                save_data(bot_data)
+            bot.reply_to(message, f"🚫 User <code>{target_id}</code> ({u_name}) ကို Ban ပြုလုပ်ပြီးပါပြီ။", reply_markup=user_control_keyboard())
+
+        elif step == "UC_UNBAN":
+            if banned_now:
+                bot_data["banned_users"] = [x for x in bot_data["banned_users"] if x != target_id]
+                save_data(bot_data)
+            bot.reply_to(message, f"✅ User <code>{target_id}</code> ({u_name}) ကို Unban ပြုလုပ်ပြီးပါပြီ။", reply_markup=user_control_keyboard())
+
+# ==================== HEALTH CHECK SERVER ====================
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain")
+        self.end_headers()
+        self.wfile.write(b"AYK Bot is alive!")
+
+def run_health_server():
+    server = HTTPServer(("0.0.0.0", PORT), HealthCheckHandler)
+    print(f"Health server started on port {PORT}")
+    server.serve_forever()
+
+# ==================== MAIN EXECUTION ====================
+if __name__ == "__main__":
+    print("Starting Health Server...")
+    threading.Thread(target=run_health_server, daemon=True).start()
+
+    print("Starting Telegram Bot Polling...")
+    bot.infinity_polling(skip_pending=True)
        
