@@ -290,3 +290,119 @@ def format_settings_summary(cfg: dict) -> str:
         f"• App Linked Users: <code>{linked_cnt}</code> ယောက် | "
         f"Banned Users: <code>{cfg.get('banned_users', 0)}</code> ယောက်"
         )
+# --- အပိုင်း (၃): Keyboards, User Control, Referral & Notification Menu Builders ---
+def build_main_menu_keyboard(user_id: int) -> types.InlineKeyboardMarkup:
+    kb = types.InlineKeyboardMarkup(row_width=2)
+    kb.add(
+        types.InlineKeyboardButton("👤 My Profile / Plan", callback_data="user_profile"),
+        types.InlineKeyboardButton("🔗 Link App Account", callback_data="user_link_app"),
+    )
+    kb.add(
+        types.InlineKeyboardButton("🎁 Referral (Pro / VIP)", callback_data="user_referral"),
+        types.InlineKeyboardButton("💳 Buy Plan (KPay / Wave)", callback_data="user_buy_plan"),
+    )
+    kb.add(
+        types.InlineKeyboardButton("📩 Notifications", callback_data="user_notifications"),
+        types.InlineKeyboardButton("🛟 Support", callback_data="user_support"),
+    )
+    if int(user_id) == OWNER_ID and OWNER_ID != 0:
+        kb.add(
+            types.InlineKeyboardButton("👑 Owner Control Panel", callback_data="owner_panel")
+        )
+    return kb
+
+
+def build_owner_panel_keyboard(cfg: dict) -> types.InlineKeyboardMarkup:
+    kb = types.InlineKeyboardMarkup(row_width=2)
+    kb.add(
+        types.InlineKeyboardButton("✏️ Edit KPay", callback_data="edit_kpay"),
+        types.InlineKeyboardButton("✏️ Edit Wave", callback_data="edit_wave"),
+    )
+    kb.add(
+        types.InlineKeyboardButton("💎 Edit Pro Price", callback_data="edit_pro_price"),
+        types.InlineKeyboardButton("👑 Edit VIP Price", callback_data="edit_vip_price"),
+    )
+    kb.add(
+        types.InlineKeyboardButton(
+            f"🎁 Ref Rate ({cfg.get('ref_rate_ks', 250)} Ks)",
+            callback_data="edit_ref_rate_ks",
+        ),
+        types.InlineKeyboardButton(
+            f"🎯 Pro/VIP Ref ({cfg.get('pro_ref_target', 12)}/{cfg.get('vip_ref_target', 20)})",
+            callback_data="menu_ref_targets",
+        ),
+    )
+    kb.add(
+        types.InlineKeyboardButton("👥 User Control", callback_data="menu_user_control"),
+        types.InlineKeyboardButton("🔔 Notification Mgmt", callback_data="menu_notifications"),
+    )
+    kb.add(
+        types.InlineKeyboardButton("📢 Send Broadcast", callback_data="start_broadcast"),
+        types.InlineKeyboardButton("🛟 Edit Support", callback_data="edit_support"),
+    )
+    kb.add(
+        types.InlineKeyboardButton("📊 View Settings", callback_data="view_settings"),
+        types.InlineKeyboardButton("🏠 Main Menu", callback_data="back_main"),
+    )
+    return kb
+
+
+def build_ref_targets_keyboard(cfg: dict) -> types.InlineKeyboardMarkup:
+    kb = types.InlineKeyboardMarkup(row_width=1)
+    kb.add(
+        types.InlineKeyboardButton(
+            f"💎 Set Pro Ref Target (လက်ရှိ: {cfg.get('pro_ref_target', 12)} ယောက်)",
+            callback_data="edit_pro_ref_target",
+        ),
+        types.InlineKeyboardButton(
+            f"👑 Set VIP Ref Target (လက်ရှိ: {cfg.get('vip_ref_target', 20)} ယောက်)",
+            callback_data="edit_vip_ref_target",
+        ),
+        types.InlineKeyboardButton("⬅️ Back to Owner Panel", callback_data="owner_panel"),
+    )
+    return kb
+
+
+def build_user_control_keyboard() -> types.InlineKeyboardMarkup:
+    kb = types.InlineKeyboardMarkup(row_width=2)
+    kb.add(
+        types.InlineKeyboardButton("🔍 Inspect User", callback_data="uc_inspect_user"),
+        types.InlineKeyboardButton("📋 User List", callback_data="uc_list_users"),
+    )
+    kb.add(
+        types.InlineKeyboardButton("🚫 Ban User", callback_data="uc_ban_user"),
+        types.InlineKeyboardButton("✅ Unban User", callback_data="uc_unban_user"),
+    )
+    kb.add(
+        types.InlineKeyboardButton("📦 Set User Plan", callback_data="uc_set_plan"),
+        types.InlineKeyboardButton("🔗 Set App Link", callback_data="uc_set_app_link"),
+    )
+    kb.add(
+        types.InlineKeyboardButton("⬅️ Back to Owner Panel", callback_data="owner_panel"),
+    )
+    return kb
+
+
+def build_plan_select_keyboard(target_user_id: int) -> types.InlineKeyboardMarkup:
+    kb = types.InlineKeyboardMarkup(row_width=3)
+    kb.add(
+        types.InlineKeyboardButton("Free", callback_data=f"setplan_{target_user_id}_free"),
+        types.InlineKeyboardButton("Pro", callback_data=f"setplan_{target_user_id}_pro"),
+        types.InlineKeyboardButton("VIP", callback_data=f"setplan_{target_user_id}_vip"),
+    )
+    kb.add(
+        types.InlineKeyboardButton("⬅️ Cancel", callback_data="menu_user_control"),
+    )
+    return kb
+
+
+def build_notifications_menu_keyboard() -> types.InlineKeyboardMarkup:
+    kb = types.InlineKeyboardMarkup(row_width=1)
+    kb.add(
+        types.InlineKeyboardButton("✏️ Edit Welcome Notification", callback_data="edit_notif_welcome"),
+        types.InlineKeyboardButton("✏️ Edit Support Prompt", callback_data="edit_notif_support_prompt"),
+        types.InlineKeyboardButton("✏️ Edit Plan Update Notice", callback_data="edit_notif_plan_update"),
+        types.InlineKeyboardButton("📢 Send Broadcast Now", callback_data="start_broadcast"),
+        types.InlineKeyboardButton("⬅️ Back to Owner Panel", callback_data="owner_panel"),
+    )
+    return kb
