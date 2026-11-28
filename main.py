@@ -91,3 +91,97 @@ EDITABLE_FIELDS = {
         "type": "str",
     },
 }
+def _default_user_record(user_id: int, username: str = "", full_name: str = "") -> dict:
+    return {
+        "user_id": int(user_id),
+        "username": username or "",
+        "full_name": full_name or "",
+        "plan": "free",
+        "app_linked": False,
+        "app_account_id": "",
+        "banned": False,
+        "referrals": 0,
+        "invited_by": None,
+    }
+
+
+def _sync_user_counts(cfg: dict) -> None:
+    users = cfg.get("users")
+    if not isinstance(users, dict):
+        cfg["users"] = {}
+        users = cfg["users"]
+
+    if users:
+        cfg["known_users"] = len(users)
+        cfg["banned_users"] = sum(
+            1 for u in users.values() if isinstance(u, dict) and u.get("banned")
+        )
+    else:
+        cfg["known_users"] = max(int(cfg.get("known_users", 0) or 0), 0)
+        cfg["banned_users"] = max(int(cfg.get("banned_users", 0) or 0), 0)
+
+
+def get_config() -> dict:
+    merged = json.loads(json.dumps(DEFAULT_CONFIG))
+    try:
+        resp = (
+            supabase.table(CONFIG_TABLE)
+            .select("data")
+            .eq("id", CONFIG_ROW_ID)
+            .limit(1)
+            .execute()
+        )
+        rows = resp.data or []
+        if rows and isinstance(rows[0].get("data"), dict):
+            db_data = rows[0]["data"]
+            for k, v in db_data.items():
+                if k == "notifications" and isinstance(v, dict):
+                    merged["notifications"].update(v)
+                elif k == "users" and isinstance(v, dict):
+                    merged["users"] = v
+                else:
+                    merged[k] = v
+    except Exception as e:
+        logger.error(f"get_config error: {e}")
+
+    _sync_user_counts(merged)
+    return merged
+
+
+def save_config(new_config: dict) -> bool:
+    try:
+        _sync_user_counts(new_config)
+        payload = {
+            "id": CONFIG_ROW_ID,
+            "data": new_config,
+        }
+        supabase.table(CONFIG_TABLE).upsert(payload, on_conflict="id").execute()
+        return True
+    except Exception as e:
+        logger.error(f"save_config error: {e}")
+        return False
+
+
+def update_config_key(key: str, value) -> bool:
+    cfg = get_config()
+    cfg[key] = value
+    return save_config(cfg)
+
+
+def register_or_update_user(user: types.User) -> dict:
+    cfg = get_config()
+    users = cfg.setdefault("users", {})
+    uid_str = str(user.id)
+    full_name = f"{user.first_name or ''} {user.last_name or ''}".strip()
+
+    if uid_str not in users or not isinstance(users[uid_str], dict):
+        users[uid_str] = _default_user_record(user.id, user.username or "", full_name)
+    else:
+        if user.username:
+            users[uid_str]["username"] = user.username
+        if full_name:
+            users[uid_str]["full_name"] = full_name
+
+    _sync_user_counts(cfg)
+    save_config(cfg)
+    return users[uid_str]
