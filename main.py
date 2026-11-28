@@ -642,3 +642,15 @@ def _handle_broadcast_text(message: types.Message):
         f"• ⚠️ မအောင်မြင်: <code>{failed_count}</code> ယောက်",
         reply_markup=build_owner_menu(cfg),
     )
+def main():
+    if not BOT_TOKEN:
+        raise RuntimeError("BOT_TOKEN environment variable is missing.")
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        raise RuntimeError("SUPABASE_URL or SUPABASE_KEY environment variable is missing.")
+
+    logger.info("AYK Recap Bot started successfully.")
+    bot.infinity_polling(skip_pending=True, timeout=20, long_polling_timeout=20)
+
+
+if __name__ == "__main__":
+    main()
