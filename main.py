@@ -452,3 +452,205 @@ def handle_owner_menu(message: types.Message):
         "⚙️ <b>Owner Control Panel</b>",
         reply_markup=markup,
     )
+# ==========================================
+# 5. CALLBACKS, BROADCAST & TEXT INPUT
+# ==========================================
+@bot.callback_query_handler(
+    func=lambda call: call.data.startswith(("approve_user:", "reject_user:"))
+    and call.from_user.id in OWNER_IDS
+)
+def handle_approve_reject_callback(call: types.CallbackQuery):
+    bot.answer_callback_query(call.id)
+    action, target_uid_str = call.data.split(":", 1)
+    target_uid = int(target_uid_str)
+
+    cfg = get_main_config()
+    data = load_data()
+
+    if action == "approve_user":
+        msg_to_user = cfg.get("approve_msg") or data["messages"].get(
+            "approve_user", "✅ သင့်အကောင့်ကို အတည်ပြုပြီးပါပြီ။"
+        )
+        status_label = "✅ Approved"
+    else:
+        msg_to_user = cfg.get("reject_msg") or data["messages"].get(
+            "reject_user", "❌ သင့်တောင်းဆိုချက်ကို ငြင်းပယ်လိုက်ပါသည်။"
+        )
+        status_label = "❌ Rejected"
+
+    try:
+        bot.send_message(target_uid, msg_to_user)
+    except Exception:
+        pass
+
+    try:
+        bot.edit_message_reply_markup(
+            call.message.chat.id, call.message.message_id, reply_markup=None
+        )
+        bot.send_message(
+            call.message.chat.id,
+            f"{status_label} for user <code>{target_uid}</code>",
+            message_thread_id=call.message.message_thread_id,
+        )
+    except Exception:
+        pass
+
+
+@bot.callback_query_handler(
+    func=lambda call: call.data in FIELD_MAP and call.from_user.id in OWNER_IDS
+)
+def handle_extra_owner_callback(call: types.CallbackQuery):
+    user_id = call.from_user.id
+    field_key = FIELD_MAP[call.data]
+
+    EDITING_STATE[user_id] = {"target": "main_config", "key": field_key}
+    bot.answer_callback_query(call.id)
+
+    cfg = get_main_config()
+    current_val = cfg.get(field_key, "(သတ်မှတ်ထားခြင်း မရှိသေးပါ)")
+
+    bot.send_message(
+        call.message.chat.id,
+        f"✏️ <b>{field_key}</b> ကို ပြင်ဆင်ရန် စာသားအသစ် ရိုက်ပို့ပေးပါ။\n"
+        f"(ပယ်ဖျက်လိုပါက /cancel ဟု ပို့ပါ)\n\n"
+        f"<b>လက်ရှိ စာသား:</b>\n{current_val}",
+    )
+
+
+@bot.callback_query_handler(
+    func=lambda call: call.data in SETTING_BUTTON_MAP
+    and call.from_user.id in OWNER_IDS
+)
+def handle_setting_edit_callback(call: types.CallbackQuery):
+    user_id = call.from_user.id
+    setting_key = SETTING_BUTTON_MAP[call.data]
+    EDITING_STATE[user_id] = {"target": "settings", "key": setting_key}
+    bot.answer_callback_query(call.id)
+
+    data = load_data()
+    current_val = data["settings"].get(setting_key, "")
+    bot.send_message(
+        call.message.chat.id,
+        f"⚙️ <b>{setting_key}</b> အတွက် တန်ဖိုးအသစ် ရိုက်ပို့ပေးပါ။\n"
+        f"(ပယ်ဖျက်လိုပါက /cancel ဟု ပို့ပါ)\n\n"
+        f"<b>လက်ရှိ တန်ဖိုး:</b> <code>{current_val}</code>",
+    )
+
+
+@bot.callback_query_handler(
+    func=lambda call: call.data in ("send_broadcast", "view_settings")
+    and call.from_user.id in OWNER_IDS
+)
+def handle_other_owner_callbacks(call: types.CallbackQuery):
+    bot.answer_callback_query(call.id)
+    if call.data == "send_broadcast":
+        BROADCAST_WAITING.add(call.from_user.id)
+        bot.send_message(
+            call.message.chat.id,
+            "📢 User များအားလုံးထံ ပို့လိုသော Broadcast စာသား ရိုက်ပို့ပေးပါ။\n"
+            "(ပယ်ဖျက်လိုပါက /cancel ဟု ပို့ပါ)",
+        )
+    elif call.data == "view_settings":
+        cfg = get_main_config()
+        merged = load_data()
+        bot.send_message(
+            call.message.chat.id,
+            f"📋 <b>Current Merged Config:</b>\n"
+            f"<pre>{json.dumps({'settings': merged['settings'], 'main_config': cfg}, ensure_ascii=False, indent=2)}</pre>",
+        )
+
+
+@bot.message_handler(
+    commands=["cancel"],
+    func=lambda m: m.from_user.id in EDITING_STATE
+    or m.from_user.id in BROADCAST_WAITING
+    or m.from_user.id in SLIP_WAITING,
+)
+def handle_cancel_any(message: types.Message):
+    uid = message.from_user.id
+    EDITING_STATE.pop(uid, None)
+    BROADCAST_WAITING.discard(uid)
+    SLIP_WAITING.discard(uid)
+    bot.reply_to(message, "❌ လုပ်ဆောင်ချက်ကို ပယ်ဖျက်လိုက်ပါပြီ။")
+
+
+@bot.message_handler(
+    func=lambda m: m.from_user.id in OWNER_IDS
+    and m.from_user.id in BROADCAST_WAITING,
+    content_types=["text"],
+)
+def handle_broadcast_send(message: types.Message):
+    BROADCAST_WAITING.discard(message.from_user.id)
+    data = load_data()
+    users = data.get("known_users", [])
+    sent_count = 0
+    failed_count = 0
+
+    for uid in users:
+        try:
+            bot.send_message(int(uid), message.text)
+            sent_count += 1
+        except Exception:
+            failed_count += 1
+
+    bot.reply_to(
+        message,
+        f"📢 Broadcast ပြီးပါပြီ။\n• Sent: {sent_count}\n• Failed: {failed_count}",
+    )
+
+
+@bot.message_handler(
+    func=lambda m: m.from_user.id in OWNER_IDS
+    and m.from_user.id in EDITING_STATE,
+    content_types=["text"],
+)
+def handle_owner_text_input(message: types.Message):
+    user_id = message.from_user.id
+    state = EDITING_STATE.pop(user_id, None)
+    if not state:
+        return
+
+    target = state["target"]
+    key = state["key"]
+    new_text = message.text
+
+    if target == "settings":
+        update_nested_setting(key, new_text)
+    else:
+        update_main_config_field(key, new_text)
+
+    bot.reply_to(
+        message,
+        f"✅ <b>{key}</b> ({target}) ကို Database ထဲတွင် အောင်မြင်စွာ Update လုပ်ပြီးပါပြီ။\n\n"
+        f"<b>စာသားအသစ်:</b>\n{new_text}",
+    )
+
+
+# ==========================================
+# 6. HEALTH / HTTP SERVER & RUNNER
+# ==========================================
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        payload = {
+            "status": "ok",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+        self.wfile.write(json.dumps(payload).encode("utf-8"))
+
+    def log_message(self, format, *args):
+        return
+
+
+def start_http_server():
+    server = HTTPServer(("0.0.0.0", PORT), HealthCheckHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+
+
+if __name__ == "__main__":
+    start_http_server()
+    print(f"Bot & HTTP health server running on port {PORT}...")
+    bot.infinity_polling(skip_pending=True)
