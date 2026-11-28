@@ -465,4 +465,51 @@ async def handle_admin_decision(callback: CallbackQuery, bot: Bot) -> None:
         except Exception:
             pass
         await callback.answer(f"Webhook error ({result['status']})", show_alert=True)
+        # ==========================================
+# PART 3: HEALTH SERVER & MAIN ENTRYPOINT
+# ==========================================
+
+
+async def health_handler(request: web.Request) -> web.Response:
+    return web.json_response({"status": "ok", "service": "AYK-Recap-Bot"})
+
+
+async def start_health_server() -> web.AppRunner:
+    app = web.Application()
+    app.router.add_get("/", health_handler)
+    app.router.add_get("/health", health_handler)
+
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, host="0.0.0.0", port=PORT)
+    await site.start()
+    return runner
+
+
+async def main() -> None:
+    if not BOT_TOKEN or BOT_TOKEN == "YOUR_BOT_TOKEN_HERE":
+        raise RuntimeError("BOT_TOKEN is missing.")
+
+    bot = Bot(
+        token=BOT_TOKEN,
+        default=DefaultBotProperties(parse_mode=ParseMode.HTML),
+    )
+    dp = Dispatcher(storage=MemoryStorage())
+    dp.include_router(router)
+
+    await load_bot_data()
+    runner = await start_health_server()
+    try:
+        await bot.delete_webhook(drop_pending_updates=False)
+        await dp.start_polling(bot)
+    finally:
+        await runner.cleanup()
+        await bot.session.close()
+
+
+if __name__ == "__main__":
+    import asyncio
+
+    asyncio.run(main())
+
              
