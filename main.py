@@ -218,3 +218,237 @@ def register_user_and_referral(user_id: int, start_payload: str = ""):
         save_main_config(cfg)
 
     return notified_referrer_id
+# ==========================================
+# 3. OWNER MENU KEYBOARD BUILDER
+# ==========================================
+def get_extra_owner_rows() -> list[list[types.InlineKeyboardButton]]:
+    """Return additional inline keyboard rows for Owner Menu."""
+    return [
+        [
+            types.InlineKeyboardButton(
+                "👋 Edit Welcome", callback_data="edit_welcome"
+            ),
+            types.InlineKeyboardButton(
+                "👥 Edit Ref Info Msg", callback_data="edit_ref_info"
+            ),
+        ],
+        [
+            types.InlineKeyboardButton(
+                "🔔 Edit Ref Notify", callback_data="edit_ref_notify"
+            ),
+            types.InlineKeyboardButton(
+                "✅ Edit Approve Msg", callback_data="edit_approve_msg"
+            ),
+        ],
+        [
+            types.InlineKeyboardButton(
+                "❌ Edit Reject Msg", callback_data="edit_reject_msg"
+            ),
+            types.InlineKeyboardButton(
+                "📩 Edit Slip Msg", callback_data="edit_slip_msg"
+            ),
+        ],
+        [
+            types.InlineKeyboardButton(
+                "📢 Custom Notices", callback_data="edit_custom_notices"
+            ),
+        ],
+    ]
+
+
+def build_owner_keyboard(
+    existing_rows: list[list[types.InlineKeyboardButton]] | None = None,
+) -> types.InlineKeyboardMarkup:
+    """Merge existing owner menu rows with extra Supabase config rows."""
+    markup = types.InlineKeyboardMarkup()
+    if existing_rows:
+        for row in existing_rows:
+            markup.row(*row)
+    for row in get_extra_owner_rows():
+        markup.row(*row)
+    return markup
+
+
+# ==========================================
+# 4. BOT HANDLERS (USER, SLIP & ADMIN)
+# ==========================================
+@bot.message_handler(commands=["start"])
+def handle_start(message: types.Message):
+    parts = message.text.split(maxsplit=1)
+    payload = parts[1].strip() if len(parts) > 1 else ""
+    referrer_id = register_user_and_referral(message.from_user.id, payload)
+
+    cfg = get_main_config()
+    data = load_data()
+    first_name = message.from_user.first_name or ""
+
+    if referrer_id:
+        notify_template = cfg.get("ref_notify_msg") or data["messages"].get(
+            "ref_notify", "🔔 Referral အသစ်ဝင်လာပါပြီ: {user}"
+        )
+        try:
+            bot.send_message(
+                referrer_id,
+                notify_template.format(
+                    user=first_name or str(message.from_user.id),
+                    first_name=first_name,
+                ),
+            )
+        except Exception:
+            pass
+
+    custom_welcome = cfg.get("welcome_message")
+    if custom_welcome:
+        text = (
+            custom_welcome.format(first_name=first_name)
+            if "{first_name}" in custom_welcome
+            else custom_welcome
+        )
+    else:
+        default_welcome = data["messages"].get(
+            "welcome", "👋 မင်္ဂလာပါ {first_name}"
+        )
+        text = default_welcome.format(first_name=first_name)
+
+    custom_notices = cfg.get("custom_notices")
+    if custom_notices:
+        text = f"{text}\n\n📢 <b>Notice:</b>\n{custom_notices}"
+
+    bot.reply_to(message, text)
+
+
+@bot.message_handler(commands=["ref"])
+def handle_ref_info(message: types.Message):
+    cfg = get_main_config()
+    data = load_data()
+    uid_str = str(message.from_user.id)
+    count = int(data.get("referral_counts", {}).get(uid_str, 0))
+    discount = data["settings"].get("referral_discount", 250)
+    bot_username = bot.get_me().username or ""
+    ref_link = f"https://t.me/{bot_username}?start={message.from_user.id}"
+
+    template = cfg.get("ref_info_msg") or data["messages"].get(
+        "ref_info", "👥 Referral အချက်အလက်\nTotal Referrals: {count}"
+    )
+    msg = template.format(
+        count=count, discount=discount, link=ref_link, user_id=message.from_user.id
+    )
+    if "{link}" not in template:
+        msg = f"{msg}\n🔗 Link: <code>{ref_link}</code>\n🎁 Discount: {discount} Ks"
+    bot.reply_to(message, msg)
+
+
+@bot.message_handler(commands=["slip"])
+def handle_slip_command(message: types.Message):
+    SLIP_WAITING.add(message.from_user.id)
+    data = load_data()
+    s = data["settings"]
+    bot.reply_to(
+        message,
+        f"💳 <b>Payment Info</b>\n"
+        f"• KPay: <code>{s.get('kpay_phone')}</code> ({s.get('kpay_name')})\n"
+        f"• Wave: <code>{s.get('wave_phone')}</code> ({s.get('wave_name')})\n"
+        f"• Pro: {s.get('pro_price')} | VIP: {s.get('vip_price')}\n\n"
+        f"📸 Slip ပုံ (သို့မဟုတ် စာသား) ပို့ပေးပါ။ (/cancel ဖြင့် ပယ်ဖျက်နိုင်သည်)",
+    )
+
+
+@bot.message_handler(
+    func=lambda m: m.from_user.id in SLIP_WAITING,
+    content_types=["photo", "text", "document"],
+)
+def handle_slip_submission(message: types.Message):
+    if message.text and message.text.strip() == "/cancel":
+        SLIP_WAITING.discard(message.from_user.id)
+        bot.reply_to(message, "❌ Slip ပေးပို့ခြင်းကို ပယ်ဖျက်လိုက်ပါပြီ။")
+        return
+
+    SLIP_WAITING.discard(message.from_user.id)
+    cfg = get_main_config()
+    data = load_data()
+
+    slip_reply = cfg.get("slip_msg") or data["messages"].get(
+        "slip_submitted", "📩 Slip ပေးပို့ပြီးပါပြီ။ Admin မှ စစ်ဆေးပေးပါမည်။"
+    )
+    bot.reply_to(message, slip_reply)
+
+    user = message.from_user
+    user_line = f"• User: {user.first_name or ''} (<code>{user.id}</code>)"
+    if user.username:
+        user_line += f"\n• Username: @{user.username}"
+    caption = f"🧾 <b>New Payment Slip</b>\n{user_line}"
+
+    markup = types.InlineKeyboardMarkup()
+    markup.row(
+        types.InlineKeyboardButton(
+            "✅ Approve", callback_data=f"approve_user:{user.id}"
+        ),
+        types.InlineKeyboardButton(
+            "❌ Reject", callback_data=f"reject_user:{user.id}"
+        ),
+    )
+
+    try:
+        if message.photo:
+            file_id = message.photo[-1].file_id
+            bot.send_photo(
+                ADMIN_GROUP_ID,
+                file_id,
+                caption=caption,
+                message_thread_id=SUPPORT_TOPIC_ID,
+                reply_markup=markup,
+            )
+        else:
+            extra_text = message.text or "[Attachment]"
+            bot.send_message(
+                ADMIN_GROUP_ID,
+                f"{caption}\n• Detail: {extra_text}",
+                message_thread_id=SUPPORT_TOPIC_ID,
+                reply_markup=markup,
+            )
+    except Exception as e:
+        print("Error forwarding slip to admin group:", e)
+
+
+@bot.message_handler(commands=["admin", "owner"])
+def handle_owner_menu(message: types.Message):
+    if message.from_user.id not in OWNER_IDS:
+        return
+
+    existing_rows = [
+        [
+            types.InlineKeyboardButton("Edit KPay", callback_data="edit_kpay"),
+            types.InlineKeyboardButton("Edit Wave", callback_data="edit_wave"),
+        ],
+        [
+            types.InlineKeyboardButton(
+                "Edit Pro Price", callback_data="edit_pro_price"
+            ),
+            types.InlineKeyboardButton(
+                "Edit VIP Price", callback_data="edit_vip_price"
+            ),
+        ],
+        [
+            types.InlineKeyboardButton(
+                "Edit Ref Discount", callback_data="edit_ref_discount"
+            ),
+            types.InlineKeyboardButton(
+                "Edit Support", callback_data="edit_support"
+            ),
+        ],
+        [
+            types.InlineKeyboardButton(
+                "📢 Broadcast", callback_data="send_broadcast"
+            ),
+            types.InlineKeyboardButton(
+                "View Settings", callback_data="view_settings"
+            ),
+        ],
+    ]
+
+    markup = build_owner_keyboard(existing_rows)
+    bot.send_message(
+        message.chat.id,
+        "⚙️ <b>Owner Control Panel</b>",
+        reply_markup=markup,
+    )
